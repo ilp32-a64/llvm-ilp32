@@ -1,0 +1,233 @@
+From 6d41fd9d9d7d3d09043dba2d11ab4d93bb929e74 Mon Sep 17 00:00:00 2001
+From: liviyifan <344781483+liviyifan@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 21:56:00 +0800
+Subject: [PATCH 3/4] [clang][Driver] Support the AArch64 GNU ILP32 ABI on
+ Linux
+
+Make clang usable as the compiler driver for aarch64[_be]-linux-gnu_ilp32,
+following GCC's aarch64-linux-gnu toolchains:
+
+- -mabi=ilp32 selects the gnu_ilp32 environment for AArch64 GNU/Linux
+  targets and -mabi=lp64 selects gnu again; both use the AAPCS64 procedure
+  call standard ("-target-abi aapcs").
+- The dynamic linker is /lib/ld-linux-aarch64[_be]_ilp32.so.1 and the GNU
+  ld emulation is aarch64linux32[b].
+- Libraries live in libilp32 (GCC's multilib OS directory for ILP32), and
+  the multiarch triple is aarch64[_be]-linux-gnu_ilp32.
+
+Signed-off-by: liviyifan <344781483+liviyifan@users.noreply.github.com>
+---
+ clang/lib/Driver/Driver.cpp                   | 16 +++++++
+ clang/lib/Driver/ToolChains/Clang.cpp         |  7 ++-
+ clang/lib/Driver/ToolChains/CommonArgs.cpp    |  4 ++
+ clang/lib/Driver/ToolChains/Linux.cpp         | 16 ++++++-
+ .../aarch64_linux_gnu_ilp32_tree/lib/.keep    |  0
+ .../libilp32/.keep                            |  0
+ .../usr/lib/.keep                             |  0
+ .../aarch64-linux-gnu_ilp32/10.5.0/crtbegin.o |  0
+ .../aarch64-linux-gnu_ilp32/10.5.0/crtend.o   |  0
+ .../usr/libilp32/crt1.o                       |  0
+ .../usr/libilp32/crti.o                       |  0
+ .../usr/libilp32/crtn.o                       |  0
+ clang/test/Driver/aarch64-gnu-ilp32.c         | 46 +++++++++++++++++++
+ 13 files changed, 85 insertions(+), 4 deletions(-)
+ create mode 100644 clang/test/Driver/Inputs/aarch64_linux_gnu_ilp32_tree/lib/.keep
+ create mode 100644 clang/test/Driver/Inputs/aarch64_linux_gnu_ilp32_tree/libilp32/.keep
+ create mode 100644 clang/test/Driver/Inputs/aarch64_linux_gnu_ilp32_tree/usr/lib/.keep
+ create mode 100644 clang/test/Driver/Inputs/aarch64_linux_gnu_ilp32_tree/usr/lib/gcc/aarch64-linux-gnu_ilp32/10.5.0/crtbegin.o
+ create mode 100644 clang/test/Driver/Inputs/aarch64_linux_gnu_ilp32_tree/usr/lib/gcc/aarch64-linux-gnu_ilp32/10.5.0/crtend.o
+ create mode 100644 clang/test/Driver/Inputs/aarch64_linux_gnu_ilp32_tree/usr/libilp32/crt1.o
+ create mode 100644 clang/test/Driver/Inputs/aarch64_linux_gnu_ilp32_tree/usr/libilp32/crti.o
+ create mode 100644 clang/test/Driver/Inputs/aarch64_linux_gnu_ilp32_tree/usr/libilp32/crtn.o
+ create mode 100644 clang/test/Driver/aarch64-gnu-ilp32.c
+
+diff --git a/clang/lib/Driver/Driver.cpp b/clang/lib/Driver/Driver.cpp
+index eb3f9cbea..461b2190e 100644
+--- a/clang/lib/Driver/Driver.cpp
++++ b/clang/lib/Driver/Driver.cpp
+@@ -791,6 +791,22 @@ static llvm::Triple computeTargetTriple(const Driver &D,
+     }
+   }
+ 
++  // If target is AArch64 GNU/Linux adjust the target triple according to the
++  // provided ABI name, as GCC does for -mabi=ilp32 and -mabi=lp64.
++  if ((Target.getArch() == llvm::Triple::aarch64 ||
++       Target.getArch() == llvm::Triple::aarch64_be) &&
++      Target.isOSLinux()) {
++    if ((A = Args.getLastArgNoClaim(options::OPT_mabi_EQ))) {
++      StringRef ABIName = A->getValue();
++      if (ABIName == "ilp32" &&
++          Target.getEnvironment() == llvm::Triple::GNU)
++        Target.setEnvironment(llvm::Triple::GNUILP32);
++      else if (ABIName == "lp64" &&
++               Target.getEnvironment() == llvm::Triple::GNUILP32)
++        Target.setEnvironment(llvm::Triple::GNU);
++    }
++  }
++
+   // If target is RISC-V adjust the target triple according to
+   // provided architecture name
+   if (Target.isRISCV()) {
+diff --git a/clang/lib/Driver/ToolChains/Clang.cpp b/clang/lib/Driver/ToolChains/Clang.cpp
+index 3fd5eef60..a43ec2582 100644
+--- a/clang/lib/Driver/ToolChains/Clang.cpp
++++ b/clang/lib/Driver/ToolChains/Clang.cpp
+@@ -1605,9 +1605,12 @@ namespace {
+ void RenderAArch64ABI(const llvm::Triple &Triple, const ArgList &Args,
+                       ArgStringList &CmdArgs) {
+   const char *ABIName = nullptr;
+-  if (Arg *A = Args.getLastArg(options::OPT_mabi_EQ))
++  if (Arg *A = Args.getLastArg(options::OPT_mabi_EQ)) {
+     ABIName = A->getValue();
+-  else if (Triple.isOSDarwin())
++    // -mabi=ilp32 and -mabi=lp64 have already selected the triple.
++    if (StringRef(ABIName) == "ilp32" || StringRef(ABIName) == "lp64")
++      ABIName = "aapcs";
++  } else if (Triple.isOSDarwin())
+     ABIName = "darwinpcs";
+   // TODO: we probably want to have some target hook here.
+   else if (Triple.isOSLinux() &&
+diff --git a/clang/lib/Driver/ToolChains/CommonArgs.cpp b/clang/lib/Driver/ToolChains/CommonArgs.cpp
+index 10a1a412e..232279e86 100644
+--- a/clang/lib/Driver/ToolChains/CommonArgs.cpp
++++ b/clang/lib/Driver/ToolChains/CommonArgs.cpp
+@@ -576,10 +576,14 @@ const char *tools::getLDMOption(const llvm::Triple &T, const ArgList &Args) {
+       return "aarch64managarm";
+     else if (aarch64::isAArch64BareMetal(T))
+       return "aarch64elf";
++    if (T.getEnvironment() == llvm::Triple::GNUILP32)
++      return "aarch64linux32";
+     return "aarch64linux";
+   case llvm::Triple::aarch64_be:
+     if (aarch64::isAArch64BareMetal(T))
+       return "aarch64elfb";
++    if (T.getEnvironment() == llvm::Triple::GNUILP32)
++      return "aarch64linux32b";
+     return "aarch64linuxb";
+   case llvm::Triple::arm:
+   case llvm::Triple::thumb:
+diff --git a/clang/lib/Driver/ToolChains/Linux.cpp b/clang/lib/Driver/ToolChains/Linux.cpp
+index d525b417b..29e8aba5e 100644
+--- a/clang/lib/Driver/ToolChains/Linux.cpp
++++ b/clang/lib/Driver/ToolChains/Linux.cpp
+@@ -88,8 +88,12 @@ std::string Linux::getMultiarchTriple(const Driver &D,
+     if (hasEffectiveTriple() &&
+         getEffectiveTriple().getEnvironment() == llvm::Triple::PAuthTest)
+       return "aarch64-linux-pauthtest";
++    if (TargetEnvironment == llvm::Triple::GNUILP32)
++      return "aarch64-linux-gnu_ilp32";
+     return "aarch64-linux-gnu";
+   case llvm::Triple::aarch64_be:
++    if (TargetEnvironment == llvm::Triple::GNUILP32)
++      return "aarch64_be-linux-gnu_ilp32";
+     return "aarch64_be-linux-gnu";
+ 
+   case llvm::Triple::loongarch64: {
+@@ -203,6 +207,10 @@ static StringRef getOSLibDir(const llvm::Triple &Triple, const ArgList &Args) {
+   if (Triple.getArch() == llvm::Triple::x86_64 && Triple.isX32())
+     return "libx32";
+ 
++  if (Triple.isAArch64() &&
++      Triple.getEnvironment() == llvm::Triple::GNUILP32)
++    return "libilp32";
++
+   if (Triple.getArch() == llvm::Triple::riscv32)
+     return "lib32";
+ 
+@@ -615,11 +623,15 @@ std::string Linux::getDynamicLinker(const ArgList &Args) const {
+ 
+   case llvm::Triple::aarch64:
+     LibDir = "lib";
+-    Loader = "ld-linux-aarch64.so.1";
++    Loader = Triple.getEnvironment() == llvm::Triple::GNUILP32
++                 ? "ld-linux-aarch64_ilp32.so.1"
++                 : "ld-linux-aarch64.so.1";
+     break;
+   case llvm::Triple::aarch64_be:
+     LibDir = "lib";
+-    Loader = "ld-linux-aarch64_be.so.1";
++    Loader = Triple.getEnvironment() == llvm::Triple::GNUILP32
++                 ? "ld-linux-aarch64_be_ilp32.so.1"
++                 : "ld-linux-aarch64_be.so.1";
+     break;
+   case llvm::Triple::arm:
+   case llvm::Triple::thumb:
+diff --git a/clang/test/Driver/Inputs/aarch64_linux_gnu_ilp32_tree/lib/.keep b/clang/test/Driver/Inputs/aarch64_linux_gnu_ilp32_tree/lib/.keep
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/clang/test/Driver/Inputs/aarch64_linux_gnu_ilp32_tree/libilp32/.keep b/clang/test/Driver/Inputs/aarch64_linux_gnu_ilp32_tree/libilp32/.keep
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/clang/test/Driver/Inputs/aarch64_linux_gnu_ilp32_tree/usr/lib/.keep b/clang/test/Driver/Inputs/aarch64_linux_gnu_ilp32_tree/usr/lib/.keep
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/clang/test/Driver/Inputs/aarch64_linux_gnu_ilp32_tree/usr/lib/gcc/aarch64-linux-gnu_ilp32/10.5.0/crtbegin.o b/clang/test/Driver/Inputs/aarch64_linux_gnu_ilp32_tree/usr/lib/gcc/aarch64-linux-gnu_ilp32/10.5.0/crtbegin.o
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/clang/test/Driver/Inputs/aarch64_linux_gnu_ilp32_tree/usr/lib/gcc/aarch64-linux-gnu_ilp32/10.5.0/crtend.o b/clang/test/Driver/Inputs/aarch64_linux_gnu_ilp32_tree/usr/lib/gcc/aarch64-linux-gnu_ilp32/10.5.0/crtend.o
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/clang/test/Driver/Inputs/aarch64_linux_gnu_ilp32_tree/usr/libilp32/crt1.o b/clang/test/Driver/Inputs/aarch64_linux_gnu_ilp32_tree/usr/libilp32/crt1.o
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/clang/test/Driver/Inputs/aarch64_linux_gnu_ilp32_tree/usr/libilp32/crti.o b/clang/test/Driver/Inputs/aarch64_linux_gnu_ilp32_tree/usr/libilp32/crti.o
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/clang/test/Driver/Inputs/aarch64_linux_gnu_ilp32_tree/usr/libilp32/crtn.o b/clang/test/Driver/Inputs/aarch64_linux_gnu_ilp32_tree/usr/libilp32/crtn.o
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/clang/test/Driver/aarch64-gnu-ilp32.c b/clang/test/Driver/aarch64-gnu-ilp32.c
+new file mode 100644
+index 000000000..e8a2e43a4
+--- /dev/null
++++ b/clang/test/Driver/aarch64-gnu-ilp32.c
+@@ -0,0 +1,46 @@
++// Check the driver support for the AArch64 GNU ILP32 ABI, laid out like a GCC
++// aarch64-linux-gnu_ilp32 toolchain (libraries in libilp32).
++
++// RUN: %clang -### %s --target=aarch64-linux-gnu_ilp32 -no-pie \
++// RUN:     --sysroot=%S/Inputs/aarch64_linux_gnu_ilp32_tree \
++// RUN:     -rtlib=platform --unwindlib=platform 2>&1 \
++// RUN:   | FileCheck %s --check-prefix=ILP32
++// RUN: %clang -### %s --target=aarch64-linux-gnu -mabi=ilp32 -no-pie \
++// RUN:     --sysroot=%S/Inputs/aarch64_linux_gnu_ilp32_tree \
++// RUN:     -rtlib=platform --unwindlib=platform 2>&1 \
++// RUN:   | FileCheck %s --check-prefix=ILP32
++// ILP32: "-cc1" "-triple" "aarch64-unknown-linux-gnu_ilp32"
++// ILP32-SAME: "-target-abi" "aapcs"
++// ILP32: "--sysroot=[[SYSROOT:[^"]+]]"
++// ILP32-SAME: "-m" "aarch64linux32"
++// ILP32-SAME: "-dynamic-linker" "/lib/ld-linux-aarch64_ilp32.so.1"
++// ILP32-SAME: "[[SYSROOT]]/usr/lib/gcc/aarch64-linux-gnu_ilp32/10.5.0/../../../../libilp32{{/|\\\\}}crt1.o"
++// ILP32-SAME: "[[SYSROOT]]/usr/lib/gcc/aarch64-linux-gnu_ilp32/10.5.0{{/|\\\\}}crtbegin.o"
++// ILP32-SAME: "-L[[SYSROOT]]/usr/lib/gcc/aarch64-linux-gnu_ilp32/10.5.0"
++// ILP32-SAME: "-L[[SYSROOT]]/usr/lib/gcc/aarch64-linux-gnu_ilp32/10.5.0/../../../../libilp32"
++// ILP32-SAME: "-L[[SYSROOT]]/lib/../libilp32"
++// ILP32-SAME: "-L[[SYSROOT]]/usr/libilp32"
++
++// RUN: %clang -### %s --target=aarch64_be-linux-gnu_ilp32 -no-pie \
++// RUN:     --sysroot=%S/Inputs/aarch64_linux_gnu_ilp32_tree \
++// RUN:     -rtlib=platform --unwindlib=platform 2>&1 \
++// RUN:   | FileCheck %s --check-prefix=ILP32BE
++// RUN: %clang -### %s --target=aarch64-linux-gnu_ilp32 -mbig-endian -no-pie \
++// RUN:     --sysroot=%S/Inputs/aarch64_linux_gnu_ilp32_tree \
++// RUN:     -rtlib=platform --unwindlib=platform 2>&1 \
++// RUN:   | FileCheck %s --check-prefix=ILP32BE
++// ILP32BE: "-cc1" "-triple" "aarch64_be-unknown-linux-gnu_ilp32"
++// ILP32BE: "-m" "aarch64linux32b"
++// ILP32BE-SAME: "-dynamic-linker" "/lib/ld-linux-aarch64_be_ilp32.so.1"
++// ILP32BE-SAME: "-L{{[^"]+}}/usr/libilp32"
++
++// -mabi=lp64 selects the LP64 ABI again.
++// RUN: %clang -### %s --target=aarch64-linux-gnu_ilp32 -mabi=lp64 -no-pie \
++// RUN:     --sysroot=%S/Inputs/aarch64_linux_gnu_ilp32_tree \
++// RUN:     -rtlib=platform --unwindlib=platform 2>&1 \
++// RUN:   | FileCheck %s --check-prefix=LP64 --implicit-check-not=libilp32 \
++// RUN:       --implicit-check-not=_ilp32.so
++// LP64: "-cc1" "-triple" "aarch64-unknown-linux-gnu"
++// LP64-SAME: "-target-abi" "aapcs"
++// LP64: "-m" "aarch64linux"
++// LP64-SAME: "-dynamic-linker" "/lib/ld-linux-aarch64.so.1"
+-- 
+2.43.0
+

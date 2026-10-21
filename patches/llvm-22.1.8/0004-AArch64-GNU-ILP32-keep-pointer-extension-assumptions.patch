@@ -1,0 +1,228 @@
+From 050a64db0f9c84eaa856894d559cff2d05d3817e Mon Sep 17 00:00:00 2001
+From: liviyifan <344781483+liviyifan@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 22:19:12 +0800
+Subject: [PATCH 4/4] [AArch64] GNU ILP32: keep pointer extension assumptions
+ for local calls
+
+Pointers received from GCC-compiled code have to be zero-extended because
+their upper 32 bits are unspecified. That cannot happen for a local function
+whose address is not taken, or for the result of a direct call to a local
+function defined in the module: all such producers are compiled by LLVM,
+which keeps pointer values zero-extended. Keep asserting the zero extension
+there instead of emitting it.
+
+On the SQLite amalgamation at -O2 this removes 224 of the 493 "mov wN, wN"
+instructions.
+
+Signed-off-by: liviyifan <344781483+liviyifan@users.noreply.github.com>
+---
+ .../Target/AArch64/AArch64ISelLowering.cpp    |  18 ++-
+ .../AArch64/ilp32-gnu-pointer-extend.ll       | 152 ++++++++++++++++++
+ 2 files changed, 167 insertions(+), 3 deletions(-)
+
+diff --git a/llvm/lib/Target/AArch64/AArch64ISelLowering.cpp b/llvm/lib/Target/AArch64/AArch64ISelLowering.cpp
+index 2c692380d..c2ea4305e 100644
+--- a/llvm/lib/Target/AArch64/AArch64ISelLowering.cpp
++++ b/llvm/lib/Target/AArch64/AArch64ISelLowering.cpp
+@@ -8528,6 +8528,13 @@ SDValue AArch64TargetLowering::lowerEHPadEntry(SDValue Chain, SDLoc const &DL,
+   return Chain;
+ }
+ 
++/// GNU ILP32 pointers from code we did not compile may carry garbage in the
++/// upper 32 bits. A local function whose address is not taken is only called
++/// from this module, where pointers are always kept zero-extended.
++static bool hasOnlyLocalCallers(const Function &F) {
++  return F.hasLocalLinkage() && !F.hasAddressTaken();
++}
++
+ SDValue AArch64TargetLowering::LowerFormalArguments(
+     SDValue Chain, CallingConv::ID CallConv, bool isVarArg,
+     const SmallVectorImpl<ISD::InputArg> &Ins, const SDLoc &DL,
+@@ -8799,7 +8806,8 @@ SDValue AArch64TargetLowering::LowerFormalArguments(
+         }
+       }
+     } else {
+-      if (Subtarget->isTargetGNUILP32() && Ins[i].Flags.isPointer())
++      if (Subtarget->isTargetGNUILP32() && Ins[i].Flags.isPointer() &&
++          !hasOnlyLocalCallers(F))
+         ArgValue = DAG.getZeroExtendInReg(ArgValue, DL, MVT::i32);
+       else if (Subtarget->isTargetILP32() && Ins[i].Flags.isPointer())
+         ArgValue = DAG.getNode(ISD::AssertZext, DL, ArgValue.getValueType(),
+@@ -10372,8 +10380,12 @@ AArch64TargetLowering::LowerCall(CallLoweringInfo &CLI,
+       Chain, InGlue, CallConv, IsVarArg, RVLocs, DL, DAG, InVals, IsThisReturn,
+       IsThisReturn ? OutVals[0] : SDValue(), RequiresSMChange);
+ 
+-  // A GNU ILP32 callee may return a pointer with garbage in the upper 32 bits.
+-  if (Subtarget->isTargetGNUILP32()) {
++  // A GNU ILP32 callee may return a pointer with garbage in the upper 32 bits,
++  // unless it is a local function compiled here.
++  const Function *CalledFn = CLI.CB ? CLI.CB->getCalledFunction() : nullptr;
++  if (Subtarget->isTargetGNUILP32() &&
++      !(CalledFn && CalledFn->hasLocalLinkage() &&
++        !CalledFn->isDeclaration())) {
+     assert(InVals.size() == Ins.size() && "unexpected call result split");
+     for (unsigned I = IsThisReturn ? 1 : 0, E = InVals.size(); I != E; ++I)
+       if (Ins[I].Flags.isPointer())
+diff --git a/llvm/test/CodeGen/AArch64/ilp32-gnu-pointer-extend.ll b/llvm/test/CodeGen/AArch64/ilp32-gnu-pointer-extend.ll
+index c586d6074..6a6da0542 100644
+--- a/llvm/test/CodeGen/AArch64/ilp32-gnu-pointer-extend.ll
++++ b/llvm/test/CodeGen/AArch64/ilp32-gnu-pointer-extend.ll
+@@ -172,3 +172,155 @@ define void @pass_from_i64(i64 %v) {
+   call void @take(ptr %p)
+   ret void
+ }
++
++; A local function whose address is not taken is only called from code
++; compiled here, which keeps pointers zero-extended: no extension needed,
++; neither for its pointer arguments nor for the pointer it returns.
++define internal i32 @local_deref(ptr %p) noinline {
++; GNU-LABEL: local_deref:
++; GNU:       // %bb.0:
++; GNU-NEXT:    ldr w0, [x0]
++; GNU-NEXT:    ret
++;
++; GNUBE-LABEL: local_deref:
++; GNUBE:       // %bb.0:
++; GNUBE-NEXT:    ldr w0, [x0]
++; GNUBE-NEXT:    ret
++;
++; DARWIN-LABEL: local_deref:
++; DARWIN:       ; %bb.0:
++; DARWIN-NEXT:    ldr w0, [x0]
++; DARWIN-NEXT:    ret
++  %v = load i32, ptr %p
++  ret i32 %v
++}
++
++define internal ptr @local_give() noinline {
++; GNU-LABEL: local_give:
++; GNU:       // %bb.0:
++; GNU-NEXT:    adrp x8, :got:gptr
++; GNU-NEXT:    ldr w8, [x8, :got_lo12:gptr]
++; GNU-NEXT:    ldr w0, [x8]
++; GNU-NEXT:    ret
++;
++; GNUBE-LABEL: local_give:
++; GNUBE:       // %bb.0:
++; GNUBE-NEXT:    adrp x8, :got:gptr
++; GNUBE-NEXT:    ldr w8, [x8, :got_lo12:gptr]
++; GNUBE-NEXT:    ldr w0, [x8]
++; GNUBE-NEXT:    ret
++;
++; DARWIN-LABEL: local_give:
++; DARWIN:       ; %bb.0:
++; DARWIN-NEXT:  Lloh0:
++; DARWIN-NEXT:    adrp x8, _gptr@PAGE
++; DARWIN-NEXT:  Lloh1:
++; DARWIN-NEXT:    ldr w0, [x8, _gptr@PAGEOFF]
++; DARWIN-NEXT:    ret
++; DARWIN-NEXT:    .loh AdrpLdr Lloh0, Lloh1
++  %p = load ptr, ptr @gptr
++  ret ptr %p
++}
++
++define i32 @call_local(ptr %p) {
++; GNU-LABEL: call_local:
++; GNU:       // %bb.0:
++; GNU-NEXT:    stp x30, x19, [sp, #-16]! // 16-byte Folded Spill
++; GNU-NEXT:    .cfi_def_cfa_offset 16
++; GNU-NEXT:    .cfi_offset w19, -8
++; GNU-NEXT:    .cfi_offset w30, -16
++; GNU-NEXT:    mov w0, w0
++; GNU-NEXT:    bl local_deref
++; GNU-NEXT:    mov w19, w0
++; GNU-NEXT:    bl local_give
++; GNU-NEXT:    ldr w8, [x0]
++; GNU-NEXT:    add w0, w19, w8
++; GNU-NEXT:    ldp x30, x19, [sp], #16 // 16-byte Folded Reload
++; GNU-NEXT:    ret
++;
++; GNUBE-LABEL: call_local:
++; GNUBE:       // %bb.0:
++; GNUBE-NEXT:    stp x30, x19, [sp, #-16]! // 16-byte Folded Spill
++; GNUBE-NEXT:    .cfi_def_cfa_offset 16
++; GNUBE-NEXT:    .cfi_offset w19, -8
++; GNUBE-NEXT:    .cfi_offset w30, -16
++; GNUBE-NEXT:    mov w0, w0
++; GNUBE-NEXT:    bl local_deref
++; GNUBE-NEXT:    mov w19, w0
++; GNUBE-NEXT:    bl local_give
++; GNUBE-NEXT:    ldr w8, [x0]
++; GNUBE-NEXT:    add w0, w19, w8
++; GNUBE-NEXT:    ldp x30, x19, [sp], #16 // 16-byte Folded Reload
++; GNUBE-NEXT:    ret
++;
++; DARWIN-LABEL: call_local:
++; DARWIN:       ; %bb.0:
++; DARWIN-NEXT:    stp x20, x19, [sp, #-32]! ; 16-byte Folded Spill
++; DARWIN-NEXT:    stp x29, x30, [sp, #16] ; 16-byte Folded Spill
++; DARWIN-NEXT:    .cfi_def_cfa_offset 32
++; DARWIN-NEXT:    .cfi_offset w30, -8
++; DARWIN-NEXT:    .cfi_offset w29, -16
++; DARWIN-NEXT:    .cfi_offset w19, -24
++; DARWIN-NEXT:    .cfi_offset w20, -32
++; DARWIN-NEXT:    bl _local_deref
++; DARWIN-NEXT:    mov w19, w0
++; DARWIN-NEXT:    bl _local_give
++; DARWIN-NEXT:    ldr w8, [x0]
++; DARWIN-NEXT:    ldp x29, x30, [sp, #16] ; 16-byte Folded Reload
++; DARWIN-NEXT:    add w0, w19, w8
++; DARWIN-NEXT:    ldp x20, x19, [sp], #32 ; 16-byte Folded Reload
++; DARWIN-NEXT:    ret
++  %v = call i32 @local_deref(ptr %p)
++  %q = call ptr @local_give()
++  %w = load i32, ptr %q
++  %s = add i32 %v, %w
++  ret i32 %s
++}
++
++; Its address escapes, so GCC-compiled code may call it.
++define internal i32 @escaping_deref(ptr %p) noinline {
++; GNU-LABEL: escaping_deref:
++; GNU:       // %bb.0:
++; GNU-NEXT:    mov w8, w0
++; GNU-NEXT:    ldr w0, [x8]
++; GNU-NEXT:    ret
++;
++; GNUBE-LABEL: escaping_deref:
++; GNUBE:       // %bb.0:
++; GNUBE-NEXT:    mov w8, w0
++; GNUBE-NEXT:    ldr w0, [x8]
++; GNUBE-NEXT:    ret
++;
++; DARWIN-LABEL: escaping_deref:
++; DARWIN:       ; %bb.0:
++; DARWIN-NEXT:    ldr w0, [x0]
++; DARWIN-NEXT:    ret
++  %v = load i32, ptr %p
++  ret i32 %v
++}
++
++define ptr @get_escaping() {
++; GNU-LABEL: get_escaping:
++; GNU:       // %bb.0:
++; GNU-NEXT:    adrp x0, escaping_deref
++; GNU-NEXT:    add x0, x0, :lo12:escaping_deref
++; GNU-NEXT:    ret
++;
++; GNUBE-LABEL: get_escaping:
++; GNUBE:       // %bb.0:
++; GNUBE-NEXT:    adrp x0, escaping_deref
++; GNUBE-NEXT:    add x0, x0, :lo12:escaping_deref
++; GNUBE-NEXT:    ret
++;
++; DARWIN-LABEL: get_escaping:
++; DARWIN:       ; %bb.0:
++; DARWIN-NEXT:  Lloh2:
++; DARWIN-NEXT:    adrp x0, _escaping_deref@PAGE
++; DARWIN-NEXT:  Lloh3:
++; DARWIN-NEXT:    add x0, x0, _escaping_deref@PAGEOFF
++; DARWIN-NEXT:    ret
++; DARWIN-NEXT:    .loh AdrpAdd Lloh2, Lloh3
++  ret ptr @escaping_deref
++}
++
++@gptr = global ptr null
+-- 
+2.43.0
+
