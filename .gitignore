@@ -1,2 +1,4 @@
 /src/
 /build/
+/tests/qemu/out/
+/tests/qemu/sqlite/

@@ -69,6 +69,17 @@ The result is an ELF32 AArch64 executable for `/lib/ld-linux-aarch64_ilp32.so.1`
   "unknown target triple", unrelated to these patches).
 - Predefined type macros compared with GCC 14 `-mabi=ilp32`; GCC 10.5, 13 and
   14 checked for their pointer passing (unchanged across versions).
+- `tests/qemu/run.sh` runs programs under QEMU system emulation with an ILP32
+  kernel (from [ilp32-test](https://github.com/ilp32-a64/ilp32-test)):
+  - `llvm-abi-O0`, `llvm-abi-O2`: GCC-compiled code passes clang-compiled code
+    pointers with garbage in the upper 32 bits (in a register, as a ninth
+    argument on the stack, as a return value), and glibc `qsort` calls a clang
+    comparator. Control: the same calls into code shaped like the output of
+    LLVM before patch 0002 must crash with SIGSEGV.
+  - `sqlite-cmp`: the sqlite3 shell built by clang alone (compile and link) and
+    the one built by GCC must print identical output for `workload.sql`.
+
+  All pass with the ilp32-6.6 kernel (2026-10-21).
 - Not yet run on hardware.
 
 ## License
