@@ -1,60 +1,36 @@
-# LLVM/clang for the AArch64 GNU ILP32 ABI
+# clang for AArch64 ILP32
 
-Patches for [LLVM](https://github.com/llvm/llvm-project) that make clang a
-working compiler for `aarch64-linux-gnu_ilp32` and `aarch64-linux-musl_ilp32`
-(AArch64 with 32-bit `long` and pointers, as GCC's `-mabi=ilp32`),
-interoperable with GCC-built code such as an ILP32 glibc or musl, plus code
-generation improvements for the ABI.
+Patches that make clang 22 compile AArch64 ILP32 code (32-bit `long` and
+pointers) for glibc (`aarch64-linux-gnu_ilp32`) and musl
+(`aarch64-linux-musl_ilp32`). The code links and runs with libraries built by
+GCC.
 
-LLVM's AArch64 back end has supported the GNU ILP32 ABI since 2021 (review
-D94143). The clang front end and driver never got the matching support (review
-D104931 was not merged), and the back end follows Apple arm64_32 rules for
-pointer extension that differ from GCC and AAPCS64.
+Upstream LLVM supports ILP32 only in the back end: the clang front end was
+never finished, and the back end passes pointers in a way that is not
+compatible with GCC. These patches fill both gaps.
 
-## Patches (LLVM 22.1.8)
+On a Cortex-A35 board, CPython built for ILP32 with this clang is **9% faster**
+than the LP64 build and uses **23–25% less memory**.
 
-| Patch | Change |
-|---|---|
-| `0001` | clang: GNU ILP32 data model. 32-bit `long`/pointers, `int64_t` and `intmax_t` are `long long`, `intptr_t` is `int`, `wchar_t` is `unsigned int`, as with GCC 14 `-mabi=ilp32`. Based on D104931, which made `wchar_t` signed by mistake. |
-| `0002` | AArch64: zero-extend received pointers. With AAPCS64 and GCC the upper 32 bits of a pointer in an X register or an 8-byte stack slot are unspecified and the receiver clears them; LLVM assumed the sender had done it (the arm64_32 rule). Without this, code built by LLVM can use garbage address bits when called from GCC-built code or when using a pointer returned by it. |
-| `0003` | Driver: `-mabi=ilp32`/`-mabi=lp64`, dynamic linker `/lib/ld-linux-aarch64[_be]_ilp32.so.1`, GNU ld emulation `aarch64linux32[b]`, `libilp32` library directories. clang can compile and link against a GCC `aarch64-linux-gnu_ilp32` toolchain on its own. |
-| `0004` | AArch64: no pointer extension for local functions whose address is not taken, and for results of direct calls to local functions (all producers are compiled by LLVM). |
-| `0005` | AArch64: no pointer extension for LLVM-only calling conventions (`preserve_none`/`_most`/`_all`, `fastcc`, `tailcc`, `coldcc`, GHC, Swift), which GCC does not implement. CPython 3.14's tail-calling interpreter: 685 of 693 `mov wN, wN` in `ceval.c` go away. |
-| `0006` | `musl_ilp32` environment (`aarch64[_be]-*-linux-musl_ilp32`, as in OpenWrt's ILP32 toolchain) with the same ABI as `gnu_ilp32`. Driver: `-mabi=ilp32`/`-mabi=lp64` with musl, dynamic linker `/lib/ld-musl-aarch64[_be]_ilp32.so.1`, libraries in `lib`. |
-| `0007` | Cortex-A35 tuning: the Cortex-A53 features (fusions, scheduling options), as GCC does. `-mcpu=cortex-a35` had none. |
-| `0008` | AArch64 FastISel: leave GNU ILP32 arguments to SelectionDAG, which zero-extends pointers. Fixes pointer arguments at `-O0`. |
-| `0009` | SelectionDAG: a pointer read from another block is known to be zero-extended (32-bit pointers in 64-bit registers), so it is not extended again. |
-| `0010` | AArch64: fold constant offsets of less than a page into load and store addresses also for GEPs without `inbounds` (computed modulo 2^32), on Linux. Off with `-mllvm -aarch64-ilp32-fold-address-offsets=false`. |
-| `0011` | AArch64 ILP32: `.note.gnu.property` in the ELF32 layout (4-byte aligned, descsz 12). GNU ld rejected the ELF64 layout ("corrupt GNU_PROPERTY_TYPE (5) size: 0x10") and dropped the BTI/PAC markings. |
+## Build clang
 
-## Build
-
-Needs git, cmake, ninja, a host C++ compiler, and `binutils-dev` for the
-LLVMgold plugin (LTO through GNU ld). The build's default target is
-`aarch64-linux-gnu_ilp32`, so `--target` can be left out.
+Needs git, cmake, ninja, a C++ compiler and `binutils-dev`.
 
 ```
-./build.sh                      # clang + tools, about 1 hour on 4 cores
-TESTS=ON ./build.sh llc FileCheck not count split-file   # for lit tests
+./build.sh        # applies the patches and builds clang, about 1 hour on 4 cores
 ```
-
-`git am` needs a git identity (`user.name`/`user.email`).
 
 ## Use
 
-With a GCC ILP32 toolchain installed under `$T` (target triple directory
-`aarch64-linux-gnu_ilp32`, sysroot with `libilp32`):
+With a GCC ILP32 toolchain in `$T` (for example the one built by
+[test-ilp32](https://github.com/ilp32-a64/test-ilp32)):
 
 ```
 clang --target=aarch64-linux-gnu_ilp32 --gcc-toolchain=$T \
       --sysroot=$T/aarch64-linux-gnu_ilp32/sysroot -O2 hello.c -o hello
-# or: clang --target=aarch64-linux-gnu -mabi=ilp32 ...
 ```
 
-The result is an ELF32 AArch64 executable for `/lib/ld-linux-aarch64_ilp32.so.1`.
-
-With an OpenWrt aarch64 ILP32 musl toolchain
-(`staging_dir/toolchain-aarch64_*_ilp32_*_musl`) in `$O`:
+With an OpenWrt ILP32 musl toolchain in `$O`:
 
 ```
 clang --target=aarch64-openwrt-linux-musl_ilp32 --gcc-toolchain=$O --sysroot=$O \
@@ -63,94 +39,61 @@ clang --target=aarch64-openwrt-linux-musl_ilp32 --gcc-toolchain=$O --sysroot=$O 
 
 ### Notes
 
-- Use `-fwrapv`, not `-fno-strict-overflow` (`-fwrapv` plus `-fwrapv-pointer`),
-  when a project needs wrapping signed arithmetic (e.g. CPython). With wrapping
-  pointer arithmetic every address has to be computed modulo 2^32 before the
-  access. Patch 0010 still folds offsets of less than a page, but indexed
-  addresses cost extra instructions: on the SQLite amalgamation at -O2 the
-  ILP32 code is 2.7% larger than LP64 (21% before 0010), against 1.4% with
-  `-fwrapv`. Since clang 20 `-fwrapv` alone no longer affects pointer
-  arithmetic.
-- For the Cortex-A35 use `-mcpu=cortex-a35` (with patch 0007). clang enables
-  the crypto extension for it by default; GCC needs `-mcpu=cortex-a35+crypto`.
-- lld does not support AArch64 ILP32: link with GNU ld (the driver picks the
-  toolchain's `ld`).
-- compiler-rt, libunwind, libc++ and the sanitizers are not built or tested for
-  ILP32; use the GCC runtime libraries (libgcc, libstdc++).
+- Link with GNU ld; lld does not support ILP32.
+- Use the GCC runtime libraries (libgcc, libstdc++); compiler-rt and libc++ do
+  not support ILP32 yet.
+- For wrapping signed arithmetic use `-fwrapv`, not `-fno-strict-overflow`,
+  which also wraps pointer arithmetic and makes the code larger.
+- With ThinLTO, link with `-Wl,-plugin-opt=-import-instr-limit=30`: same speed,
+  about 0.3 MB less memory.
+- For the Cortex-A35 use `-mcpu=cortex-a35`.
 
-## Results
+## Performance (Cortex-A35 board, CPython 3.14.9)
 
-Static instruction counts (`llvm-objdump`), clang with these patches:
-
-| Code | Before 0009/0010 | With 0009/0010 |
+| Build | Speed | Memory |
 |---|---:|---:|
-| SQLite amalgamation, `-O2 -fwrapv`, ILP32 vs LP64 | +2.0% | +1.4% |
-| SQLite amalgamation, `-O2 -fno-strict-overflow`, ILP32 vs LP64 | +20.7% | +2.7% |
-| CPython 3.14.9 (`-O3 -fwrapv`, tail-calling interpreter), ILP32 | 731,977 | 719,029 |
+| LP64, GCC 14 | 1.00 | 17.0 MB |
+| ILP32, GCC 14 | 1.02 | 11.4 MB (-33%) |
+| ILP32, clang (PGO + ThinLTO + tail calls) | 1.09 | 13.0 MB (-23%) |
+| ILP32, clang, with `-import-instr-limit=30` | 1.09 | 12.7 MB (-25%) |
+| armhf, GCC 14 | 1.00 | 10.6 MB (-38%) |
 
-For comparison, GCC 14 `-mabi=ilp32` is 1.9% larger than `-mabi=lp64` on the
-SQLite amalgamation (`-O2 -fwrapv`, same headers). Run time has not been
-measured on hardware yet.
+All builds use PGO and LTO; geometric mean of 9 benchmarks. Method, SQLite,
+per-benchmark results and a code size analysis:
+[docs/benchmarks.md](docs/benchmarks.md).
+
+## Patches (LLVM 22.1.8)
+
+| Patch | Change |
+|---|---|
+| `0001` | ILP32 data types, as in GCC |
+| `0002` | Clear the upper 32 bits of received pointers (the key to working with GCC code) |
+| `0003` | Driver: `-mabi=ilp32`, dynamic linker, library paths |
+| `0004`–`0005` | Skip pointer extensions that are not needed |
+| `0006` | musl ILP32 target |
+| `0007` | Cortex-A35 tuning |
+| `0008` | Pointer arguments at `-O0` |
+| `0009`–`0010` | Smaller ILP32 code |
+| `0011` | BTI/PAC markings for ILP32 (ELF32 layout) |
+
+Each patch's commit message has the details.
 
 ## Testing
 
-- New lit tests: `clang/test/CodeGen/AArch64/aarch64-gnu-ilp32.c`,
-  `clang/test/Driver/aarch64-gnu-ilp32.c`, `clang/test/Driver/aarch64-musl-ilp32.c`,
-  `llvm/test/CodeGen/AArch64/ilp32-gnu-pointer-extend.ll`,
-  `ilp32-gnu-fastisel-args.ll`, `ilp32-gnu-cross-block-pointer.ll`,
-  `ilp32-gnu-address-offset-fold.ll`, `note-gnu-property-ilp32.ll`; additions to `TripleTest.cpp`,
-  `llvm/test/MC/AArch64/arm64-ilp32.s` and the `misched-fusion` tests.
-- `llvm/test/CodeGen/AArch64`, `llvm/test/MC/AArch64`,
-  `clang/test/CodeGen/AArch64` and `clang/test/Driver` pass (in an
-  AArch64-only build the tests that use the host's default triple fail with
-  "unknown target triple", unrelated to these patches).
-- Predefined type macros compared with GCC 14 `-mabi=ilp32`; GCC 10.5, 13 and
-  14 checked for their pointer passing (unchanged across versions).
-- `tests/qemu/run.sh` runs programs under QEMU system emulation with an ILP32
-  kernel and the glibc ILP32 toolchain (GCC 14.3, glibc 2.41) from
-  [test-ilp32](https://github.com/ilp32-a64/test-ilp32):
-  - `llvm-abi-O0`, `llvm-abi-O2`: GCC-compiled code passes clang-compiled code
-    pointers with garbage in the upper 32 bits (in a register, as a ninth
-    argument on the stack, as a return value), and glibc `qsort` calls a clang
-    comparator. Control: the same calls into code shaped like the output of
-    LLVM before patch 0002 must crash with SIGSEGV.
-  - `sqlite-cmp`: the sqlite3 shell built by clang alone (compile and link) and
-    the one built by GCC must print identical output for `workload.sql`.
+- The LLVM and clang AArch64 tests and the new ILP32 tests pass.
+- In QEMU, code built by clang and by GCC works together, with glibc and with musl.
+- CPython built by clang passes the same tests as the GCC build in QEMU, and
+  selected tests on the board.
 
-  All pass with the ilp32-6.12.y kernel and glibc 2.41 (2026-10-23).
-- `tests/qemu/run-musl.sh` runs the same tests with musl: the GCC side and the
-  runtime come from an OpenWrt aarch64 ILP32 musl toolchain, clang uses
-  `--target=aarch64-openwrt-linux-musl_ilp32`. All pass with the ilp32-6.12.y kernel
-  (2026-10-23).
-- CPython 3.14.9 cross-built by clang (tail-calling interpreter; also with PGO
-  and ThinLTO) passes the same regrtest subset under QEMU as the GCC build:
-  65 of 68 test files, the 3 failures (`test_os`, `test_posix`, `test_sys`)
-  come from the minimal test system.
-- Not yet run on hardware.
+Details: [tests/README.md](tests/README.md).
 
-## Upstreaming and maintenance: help wanted
+## Upstreaming
 
-The author does not plan to submit these patches to LLVM. Anyone is welcome to
-take them upstream, whole or in part, under their own name, without asking
-first. Please keep the original `Signed-off-by` line (or credit the author in
-the commit message) next to your own, and feel free to rework the patches as
-reviewers ask.
-
-Likewise, anyone who wants to maintain the GNU ILP32 support in LLVM, or an
-AArch64 ILP32 target in other compilers built on LLVM such as Rust's
-`aarch64-unknown-linux-gnu_ilp32` (and a future `musl_ilp32`), is welcome to
-take that role.
-
-Notes for a submission:
-
-- `0007` (Cortex-A35 tuning) does not depend on ILP32 and can go on its own.
-- `0001` and `0003` continue review D104931.
-- The AArch64 ILP32 kernel and C library ports these patches are used with are
-  not upstream either; reviewers are likely to ask about that.
-
-Issues and pull requests in this repository are welcome too.
+The author does not plan to submit these patches upstream. Anyone is welcome
+to submit them under their own name; please keep the original
+`Signed-off-by`. Maintainers are welcome too, including for Rust's ILP32
+target. `0007` does not depend on ILP32 and can go on its own.
 
 ## License
 
-The patches are contributions to LLVM and are under the same license, Apache
-License v2.0 with LLVM Exceptions (see `LICENSE`).
+Apache License v2.0 with LLVM Exceptions (see `LICENSE`).
