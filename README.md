@@ -120,7 +120,8 @@ measured on hardware yet.
   All pass with the ilp32-6.12.y kernel and glibc 2.41 (2026-10-23).
 - `tests/qemu/run-musl.sh` runs the same tests with musl: the GCC side and the
   runtime come from an OpenWrt aarch64 ILP32 musl toolchain, clang uses
-  `--target=aarch64-openwrt-linux-musl_ilp32`. All pass (2026-10-22).
+  `--target=aarch64-openwrt-linux-musl_ilp32`. All pass with the ilp32-6.12.y kernel
+  (2026-10-23).
 - CPython 3.14.9 cross-built by clang (tail-calling interpreter; also with PGO
   and ThinLTO) passes the same regrtest subset under QEMU as the GCC build:
   65 of 68 test files, the 3 failures (`test_os`, `test_posix`, `test_sys`)

@@ -7,7 +7,7 @@
 #   llvm-abi-O0/-O2  GCC <-> clang pointer passing (abi_gcc.c, abi_clang.c, abi_old.S)
 #   sqlite-cmp       GCC-built vs clang-built sqlite3 shell on workload.sql
 # Environment: SQLFLAGS (extra clang flags for the clang-built sqlite3)
-# Usage: run-musl.sh [kernel name]   (default ilp32-6.6-a32, i.e. test-ilp32/qemu/out/Image-<name>)
+# Usage: run-musl.sh [kernel name]   (default ilp32-6.12.y-a32, i.e. test-ilp32/qemu/out/Image-<name>)
 # Environment: OPENWRT_TOOLCHAIN (OpenWrt staging_dir/toolchain-aarch64_*_ilp32_*_musl,
 #              default: the first one in ~/work/openwrt-ilp32),
 #              ILP32_TEST (test-ilp32 checkout, default ~/work/test-ilp32),
@@ -15,7 +15,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 D=$PWD
-K=${1:-ilp32-6.6-a32}
+K=${1:-ilp32-6.12.y-a32}
 IT=${ILP32_TEST:-$HOME/work/test-ilp32}
 T=aarch64-openwrt-linux-musl_ilp32
 OWT=${OPENWRT_TOOLCHAIN:-$(ls -d $HOME/work/openwrt-ilp32/staging_dir/toolchain-aarch64_*_ilp32_gcc-*_musl 2>/dev/null | head -1)}
