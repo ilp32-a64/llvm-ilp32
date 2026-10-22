@@ -1,7 +1,7 @@
 From ef06cd7578edb51e6846347a741dd784ebde0a04 Mon Sep 17 00:00:00 2001
 From: liviyifan <344781483+liviyifan@users.noreply.github.com>
 Date: Thu, 22 Oct 2026 21:14:55 +0800
-Subject: [PATCH 07/10] [AArch64] Tune the Cortex-A35 like the Cortex-A53
+Subject: [PATCH 07/11] [AArch64] Tune the Cortex-A35 like the Cortex-A53
 
 TuneA35 had no tuning features, so -mcpu=cortex-a35 got none of the
 macro-op fusions and scheduling options of -mcpu=cortex-a53. GCC tunes the

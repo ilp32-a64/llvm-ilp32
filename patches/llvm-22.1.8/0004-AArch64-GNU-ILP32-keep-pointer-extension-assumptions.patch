@@ -1,7 +1,7 @@
 From c3887ad1c1ddbb8ea1a336d62806cc90811d297b Mon Sep 17 00:00:00 2001
 From: liviyifan <344781483+liviyifan@users.noreply.github.com>
 Date: Wed, 21 Oct 2026 22:19:12 +0800
-Subject: [PATCH 04/10] [AArch64] GNU ILP32: keep pointer extension assumptions
+Subject: [PATCH 04/11] [AArch64] GNU ILP32: keep pointer extension assumptions
  for local calls
 
 Pointers received from GCC-compiled code have to be zero-extended because

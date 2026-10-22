@@ -1,0 +1,110 @@
+From 3c193d7c24c45f9c301c759ea0ef7c8d9ad1522f Mon Sep 17 00:00:00 2001
+From: liviyifan <344781483+liviyifan@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 21:47:17 +0800
+Subject: [PATCH 11/11] [AArch64] ILP32: emit .note.gnu.property in the ELF32
+ layout
+
+AArch64TargetStreamer::emitNoteSection always used the ELF64 layout: the
+note 8-byte aligned and the 4-byte GNU_PROPERTY_AARCH64_FEATURE_1_AND data
+padded to 8 bytes (descsz 16). ILP32 objects are ELF32, whose notes and
+properties are 4-byte aligned (descsz 12), as GCC emits them. GNU ld
+reported "corrupt GNU_PROPERTY_TYPE (5) size: 0x10" for such objects and
+dropped the BTI and PAC markings of the output.
+
+Signed-off-by: liviyifan <344781483+liviyifan@users.noreply.github.com>
+---
+ .../MCTargetDesc/AArch64TargetStreamer.cpp    | 14 +++++---
+ .../AArch64/note-gnu-property-ilp32.ll        | 35 +++++++++++++++++++
+ 2 files changed, 44 insertions(+), 5 deletions(-)
+ create mode 100644 llvm/test/CodeGen/AArch64/note-gnu-property-ilp32.ll
+
+diff --git a/llvm/lib/Target/AArch64/MCTargetDesc/AArch64TargetStreamer.cpp b/llvm/lib/Target/AArch64/MCTargetDesc/AArch64TargetStreamer.cpp
+index d742b282b..5b1e48ffa 100644
+--- a/llvm/lib/Target/AArch64/MCTargetDesc/AArch64TargetStreamer.cpp
++++ b/llvm/lib/Target/AArch64/MCTargetDesc/AArch64TargetStreamer.cpp
+@@ -74,16 +74,19 @@ void AArch64TargetStreamer::emitNoteSection(unsigned Flags,
+                                             uint64_t PAuthABIVersion) {
+   assert((PAuthABIPlatform == uint64_t(-1)) ==
+          (PAuthABIVersion == uint64_t(-1)));
++  MCStreamer &OutStreamer = getStreamer();
++  MCContext &Context = OutStreamer.getContext();
++  // ILP32 objects are ELF32, whose notes and properties are 4-byte aligned
++  // (ELF64: 8-byte aligned, so the 4-byte feature data is padded).
++  bool IsELF32 = Context.getTargetTriple().isILP32Environment();
+   uint64_t DescSz = 0;
+   if (Flags != 0)
+-    DescSz += 4 * 4;
++    DescSz += IsELF32 ? 3 * 4 : 4 * 4;
+   if (PAuthABIPlatform != uint64_t(-1))
+     DescSz += 4 + 4 + 8 * 2;
+   if (DescSz == 0)
+     return;
+ 
+-  MCStreamer &OutStreamer = getStreamer();
+-  MCContext &Context = OutStreamer.getContext();
+   // Emit a .note.gnu.property section with the flags.
+   MCSectionELF *Nt = Context.getELFSection(".note.gnu.property", ELF::SHT_NOTE,
+                                            ELF::SHF_ALLOC);
+@@ -98,7 +101,7 @@ void AArch64TargetStreamer::emitNoteSection(unsigned Flags,
+   OutStreamer.switchSection(Nt);
+ 
+   // Emit the note header.
+-  OutStreamer.emitValueToAlignment(Align(8));
++  OutStreamer.emitValueToAlignment(IsELF32 ? Align(4) : Align(8));
+   OutStreamer.emitIntValue(4, 4);     // data size for "GNU\0"
+   OutStreamer.emitIntValue(DescSz, 4); // Elf_Prop array size
+   OutStreamer.emitIntValue(ELF::NT_GNU_PROPERTY_TYPE_0, 4);
+@@ -109,7 +112,8 @@ void AArch64TargetStreamer::emitNoteSection(unsigned Flags,
+     OutStreamer.emitIntValue(ELF::GNU_PROPERTY_AARCH64_FEATURE_1_AND, 4);
+     OutStreamer.emitIntValue(4, 4);     // data size
+     OutStreamer.emitIntValue(Flags, 4); // data
+-    OutStreamer.emitIntValue(0, 4);     // pad
++    if (!IsELF32)
++      OutStreamer.emitIntValue(0, 4); // pad
+   }
+ 
+   // Emit the PAuth ABI compatibility info
+diff --git a/llvm/test/CodeGen/AArch64/note-gnu-property-ilp32.ll b/llvm/test/CodeGen/AArch64/note-gnu-property-ilp32.ll
+new file mode 100644
+index 000000000..f7d83bacf
+--- /dev/null
++++ b/llvm/test/CodeGen/AArch64/note-gnu-property-ilp32.ll
+@@ -0,0 +1,35 @@
++; ILP32 objects are ELF32: the note and its properties are 4-byte aligned and
++; the 4-byte feature data is not padded (descsz 12, not 16).
++; RUN: llc -mtriple=aarch64-linux-gnu_ilp32 %s -o - | FileCheck %s --check-prefix=ASM
++; RUN: llc -mtriple=aarch64-linux-musl_ilp32 %s -o - | FileCheck %s --check-prefix=ASM
++; RUN: llc -mtriple=aarch64-linux-gnu_ilp32 %s -filetype=obj -o %t.o
++; RUN: llvm-readelf --notes %t.o | FileCheck %s --check-prefix=OBJ
++; RUN: llvm-readelf -S %t.o | FileCheck %s --check-prefix=SEC
++
++define dso_local i32 @f() {
++entry:
++  ret i32 0
++}
++
++!llvm.module.flags = !{!0, !1, !2, !3}
++
++!0 = !{i32 8, !"branch-target-enforcement", i32 1}
++!1 = !{i32 8, !"sign-return-address", i32 1}
++!2 = !{i32 8, !"sign-return-address-all", i32 0}
++!3 = !{i32 8, !"sign-return-address-with-bkey", i32 0}
++
++; ASM:      .section .note.gnu.property,"a",@note
++; ASM-NEXT: .p2align 2, 0x0
++; ASM-NEXT: .word 4
++; ASM-NEXT: .word 12
++; ASM-NEXT: .word 5
++; ASM-NEXT: .asciz "GNU"
++; ASM-NEXT: .word 3221225472
++; ASM-NEXT: .word 4
++; ASM-NEXT: .word 3
++; ASM-NOT:  .word
++
++; OBJ:      GNU                   0x0000000c	NT_GNU_PROPERTY_TYPE_0 (property note)
++; OBJ-NEXT:   Properties: aarch64 feature: BTI, PAC
++
++; SEC: .note.gnu.property NOTE {{[0-9a-f]+ [0-9a-f]+ [0-9a-f]+}} 00 A 0 0 4
+-- 
+2.43.0
+

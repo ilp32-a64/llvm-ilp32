@@ -25,6 +25,7 @@ pointer extension that differ from GCC and AAPCS64.
 | `0008` | AArch64 FastISel: leave GNU ILP32 arguments to SelectionDAG, which zero-extends pointers. Fixes pointer arguments at `-O0`. |
 | `0009` | SelectionDAG: a pointer read from another block is known to be zero-extended (32-bit pointers in 64-bit registers), so it is not extended again. |
 | `0010` | AArch64: fold constant offsets of less than a page into load and store addresses also for GEPs without `inbounds` (computed modulo 2^32), on Linux. Off with `-mllvm -aarch64-ilp32-fold-address-offsets=false`. |
+| `0011` | AArch64 ILP32: `.note.gnu.property` in the ELF32 layout (4-byte aligned, descsz 12). GNU ld rejected the ELF64 layout ("corrupt GNU_PROPERTY_TYPE (5) size: 0x10") and dropped the BTI/PAC markings. |
 
 ## Build
 
@@ -97,7 +98,7 @@ measured on hardware yet.
   `clang/test/Driver/aarch64-gnu-ilp32.c`, `clang/test/Driver/aarch64-musl-ilp32.c`,
   `llvm/test/CodeGen/AArch64/ilp32-gnu-pointer-extend.ll`,
   `ilp32-gnu-fastisel-args.ll`, `ilp32-gnu-cross-block-pointer.ll`,
-  `ilp32-gnu-address-offset-fold.ll`; additions to `TripleTest.cpp`,
+  `ilp32-gnu-address-offset-fold.ll`, `note-gnu-property-ilp32.ll`; additions to `TripleTest.cpp`,
   `llvm/test/MC/AArch64/arm64-ilp32.s` and the `misched-fusion` tests.
 - `llvm/test/CodeGen/AArch64`, `llvm/test/MC/AArch64`,
   `clang/test/CodeGen/AArch64` and `clang/test/Driver` pass (in an

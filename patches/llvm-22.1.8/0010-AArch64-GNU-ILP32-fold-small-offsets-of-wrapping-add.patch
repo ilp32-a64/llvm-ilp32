@@ -1,7 +1,7 @@
 From 0ae89dffb6a35b805a649274347435fbb600de5f Mon Sep 17 00:00:00 2001
 From: liviyifan <344781483+liviyifan@users.noreply.github.com>
 Date: Thu, 22 Oct 2026 21:35:16 +0800
-Subject: [PATCH 10/10] [AArch64] GNU ILP32: fold small offsets of wrapping
+Subject: [PATCH 10/11] [AArch64] GNU ILP32: fold small offsets of wrapping
  addresses
 
 A GEP without inbounds computes its address modulo 2^32, so a load or store
