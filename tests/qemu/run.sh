@@ -1,17 +1,17 @@
 #!/bin/bash
 # Correctness tests for the clang AArch64 GNU ILP32 patches under QEMU (system
-# emulation with an ILP32 kernel, toolchain and runtime from ilp32-test,
-# https://github.com/ilp32-a64/ilp32-test, built beforehand):
+# emulation with an ILP32 kernel, toolchain and runtime from test-ilp32,
+# https://github.com/ilp32-a64/test-ilp32, built beforehand):
 #   llvm-abi-O0/-O2  GCC <-> clang pointer passing (abi_gcc.c, abi_clang.c, abi_old.S)
 #   sqlite-cmp       GCC-built vs clang-built sqlite3 shell on workload.sql
-# Usage: run.sh [kernel name]   (default ilp32-6.6-a32, i.e. ilp32-test/qemu/out/Image-<name>)
-# Environment: ILP32_TEST (ilp32-test checkout, default ~/work/ilp32-test),
+# Usage: run.sh [kernel name]   (default ilp32-6.6-a32, i.e. test-ilp32/qemu/out/Image-<name>)
+# Environment: ILP32_TEST (test-ilp32 checkout, default ~/work/test-ilp32),
 #              CLANG (default: the clang built by ../../build.sh)
 set -euo pipefail
 cd "$(dirname "$0")"
 D=$PWD
 K=${1:-ilp32-6.6-a32}
-IT=${ILP32_TEST:-$HOME/work/ilp32-test}
+IT=${ILP32_TEST:-$HOME/work/test-ilp32}
 TC=$IT/toolchain/out
 T=aarch64-linux-gnu_ilp32
 SYSROOT=$TC/$T/sysroot

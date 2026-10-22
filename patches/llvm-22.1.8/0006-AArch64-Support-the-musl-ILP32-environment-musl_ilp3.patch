@@ -1,0 +1,512 @@
+From d843fb17e031b3cc9903db67f431016030d6e91a Mon Sep 17 00:00:00 2001
+From: liviyifan <344781483+liviyifan@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 20:58:40 +0800
+Subject: [PATCH 06/10] [AArch64] Support the musl ILP32 environment
+ (musl_ilp32)
+
+Add the environment musl_ilp32 for the AArch64 ILP32 ABI with musl, as in
+aarch64-openwrt-linux-musl_ilp32 (OpenWrt's aarch64 ILP32 toolchain). It uses
+the same data model and calling convention as gnu_ilp32.
+
+- Triple::MuslILP32, parsed before "musl"; isMusl() includes it, and the
+  new Triple::isILP32Environment() is true for gnu_ilp32 and musl_ilp32.
+- Use isILP32Environment() where only GNUILP32 was checked: the data layout,
+  the ELF EH encoding, the AArch64 backend (isTargetILP32, isTargetGNUILP32),
+  the MC layer and clang's data model.
+- Driver: -mabi=ilp32 and -mabi=lp64 switch between musl and musl_ilp32 as
+  they do between gnu and gnu_ilp32; the dynamic linker is
+  /lib/ld-musl-aarch64[_be]_ilp32.so.1 and the ld emulation
+  aarch64linux32[b]. The libilp32 directory, the multiarch triple and the
+  glibc dynamic linker stay GNU-only: musl ILP32 keeps its libraries in lib.
+
+Signed-off-by: liviyifan <344781483+liviyifan@users.noreply.github.com>
+---
+ clang/lib/Basic/Targets/AArch64.cpp           |  5 +--
+ clang/lib/Driver/Driver.cpp                   | 16 +++++---
+ clang/lib/Driver/ToolChains/CommonArgs.cpp    |  4 +-
+ clang/lib/Driver/ToolChains/Linux.cpp         |  2 +
+ .../test/CodeGen/AArch64/aarch64-gnu-ilp32.c  | 12 ++++--
+ .../include/.keep                             |  0
+ .../lib/crt1.o                                |  0
+ .../lib/crti.o                                |  0
+ .../lib/crtn.o                                |  0
+ .../14.3.0/crtbegin.o                         |  0
+ .../14.3.0/crtend.o                           |  0
+ clang/test/Driver/aarch64-musl-ilp32.c        | 39 +++++++++++++++++++
+ llvm/include/llvm/TargetParser/Triple.h       | 12 +++++-
+ .../CodeGen/TargetLoweringObjectFileImpl.cpp  |  2 +-
+ llvm/lib/Target/AArch64/AArch64Subtarget.h    | 14 +++----
+ .../Target/AArch64/AArch64TargetMachine.cpp   |  2 +-
+ .../AArch64/AsmParser/AArch64AsmParser.cpp    |  2 +-
+ .../MCTargetDesc/AArch64AsmBackend.cpp        |  4 +-
+ .../AArch64/MCTargetDesc/AArch64MCAsmInfo.cpp |  2 +-
+ .../MCTargetDesc/AArch64MCCodeEmitter.cpp     |  2 +-
+ llvm/lib/TargetParser/TargetDataLayout.cpp    |  2 +-
+ llvm/lib/TargetParser/Triple.cpp              |  3 ++
+ .../AArch64/ilp32-gnu-pointer-extend.ll       | 10 +++--
+ llvm/test/MC/AArch64/arm64-ilp32.s            |  2 +
+ llvm/unittests/TargetParser/TripleTest.cpp    | 26 +++++++++++++
+ 25 files changed, 125 insertions(+), 36 deletions(-)
+ create mode 100644 clang/test/Driver/Inputs/aarch64_openwrt_musl_ilp32_tree/include/.keep
+ create mode 100644 clang/test/Driver/Inputs/aarch64_openwrt_musl_ilp32_tree/lib/crt1.o
+ create mode 100644 clang/test/Driver/Inputs/aarch64_openwrt_musl_ilp32_tree/lib/crti.o
+ create mode 100644 clang/test/Driver/Inputs/aarch64_openwrt_musl_ilp32_tree/lib/crtn.o
+ create mode 100644 clang/test/Driver/Inputs/aarch64_openwrt_musl_ilp32_tree/lib/gcc/aarch64-openwrt-linux-musl_ilp32/14.3.0/crtbegin.o
+ create mode 100644 clang/test/Driver/Inputs/aarch64_openwrt_musl_ilp32_tree/lib/gcc/aarch64-openwrt-linux-musl_ilp32/14.3.0/crtend.o
+ create mode 100644 clang/test/Driver/aarch64-musl-ilp32.c
+
+diff --git a/clang/lib/Basic/Targets/AArch64.cpp b/clang/lib/Basic/Targets/AArch64.cpp
+index c0cc4db83..d30e3f020 100644
+--- a/clang/lib/Basic/Targets/AArch64.cpp
++++ b/clang/lib/Basic/Targets/AArch64.cpp
+@@ -135,7 +135,7 @@ AArch64TargetInfo::AArch64TargetInfo(const llvm::Triple &Triple,
+     if (!getTriple().isOSDarwin() && !getTriple().isOSNetBSD())
+       WCharType = UnsignedInt;
+ 
+-    if (getTriple().getEnvironment() == llvm::Triple::GNUILP32) {
++    if (getTriple().isILP32Environment()) {
+       // Match GCC -mabi=ilp32: long is 32-bit, int64_t is long long and
+       // intptr_t is int.
+       Int64Type = SignedLongLong;
+@@ -155,8 +155,7 @@ AArch64TargetInfo::AArch64TargetInfo(const llvm::Triple &Triple,
+   HasFloat16 = true;
+   HasStrictFP = true;
+ 
+-  if (Triple.isArch64Bit() &&
+-      getTriple().getEnvironment() != llvm::Triple::GNUILP32)
++  if (Triple.isArch64Bit() && !getTriple().isILP32Environment())
+     LongWidth = LongAlign = PointerWidth = PointerAlign = 64;
+   else
+     LongWidth = LongAlign = PointerWidth = PointerAlign = 32;
+diff --git a/clang/lib/Driver/Driver.cpp b/clang/lib/Driver/Driver.cpp
+index 461b2190e..390220ba6 100644
+--- a/clang/lib/Driver/Driver.cpp
++++ b/clang/lib/Driver/Driver.cpp
+@@ -791,19 +791,23 @@ static llvm::Triple computeTargetTriple(const Driver &D,
+     }
+   }
+ 
+-  // If target is AArch64 GNU/Linux adjust the target triple according to the
+-  // provided ABI name, as GCC does for -mabi=ilp32 and -mabi=lp64.
++  // If target is AArch64 Linux (glibc or musl) adjust the target triple
++  // according to the provided ABI name, as GCC does for -mabi=ilp32 and
++  // -mabi=lp64.
+   if ((Target.getArch() == llvm::Triple::aarch64 ||
+        Target.getArch() == llvm::Triple::aarch64_be) &&
+       Target.isOSLinux()) {
+     if ((A = Args.getLastArgNoClaim(options::OPT_mabi_EQ))) {
+       StringRef ABIName = A->getValue();
+-      if (ABIName == "ilp32" &&
+-          Target.getEnvironment() == llvm::Triple::GNU)
++      llvm::Triple::EnvironmentType Env = Target.getEnvironment();
++      if (ABIName == "ilp32" && Env == llvm::Triple::GNU)
+         Target.setEnvironment(llvm::Triple::GNUILP32);
+-      else if (ABIName == "lp64" &&
+-               Target.getEnvironment() == llvm::Triple::GNUILP32)
++      else if (ABIName == "ilp32" && Env == llvm::Triple::Musl)
++        Target.setEnvironment(llvm::Triple::MuslILP32);
++      else if (ABIName == "lp64" && Env == llvm::Triple::GNUILP32)
+         Target.setEnvironment(llvm::Triple::GNU);
++      else if (ABIName == "lp64" && Env == llvm::Triple::MuslILP32)
++        Target.setEnvironment(llvm::Triple::Musl);
+     }
+   }
+ 
+diff --git a/clang/lib/Driver/ToolChains/CommonArgs.cpp b/clang/lib/Driver/ToolChains/CommonArgs.cpp
+index 232279e86..1d75eb818 100644
+--- a/clang/lib/Driver/ToolChains/CommonArgs.cpp
++++ b/clang/lib/Driver/ToolChains/CommonArgs.cpp
+@@ -576,13 +576,13 @@ const char *tools::getLDMOption(const llvm::Triple &T, const ArgList &Args) {
+       return "aarch64managarm";
+     else if (aarch64::isAArch64BareMetal(T))
+       return "aarch64elf";
+-    if (T.getEnvironment() == llvm::Triple::GNUILP32)
++    if (T.isILP32Environment())
+       return "aarch64linux32";
+     return "aarch64linux";
+   case llvm::Triple::aarch64_be:
+     if (aarch64::isAArch64BareMetal(T))
+       return "aarch64elfb";
+-    if (T.getEnvironment() == llvm::Triple::GNUILP32)
++    if (T.isILP32Environment())
+       return "aarch64linux32b";
+     return "aarch64linuxb";
+   case llvm::Triple::arm:
+diff --git a/clang/lib/Driver/ToolChains/Linux.cpp b/clang/lib/Driver/ToolChains/Linux.cpp
+index 29e8aba5e..90f10a363 100644
+--- a/clang/lib/Driver/ToolChains/Linux.cpp
++++ b/clang/lib/Driver/ToolChains/Linux.cpp
+@@ -610,6 +610,8 @@ std::string Linux::getDynamicLinker(const ArgList &Args) const {
+     if (Arch == llvm::Triple::ppc &&
+         Triple.getSubArch() == llvm::Triple::PPCSubArch_spe)
+       ArchName = "powerpc-sf";
++    if (Triple.isILP32Environment())
++      ArchName += "_ilp32";
+ 
+     return "/lib/ld-musl-" + ArchName + ".so.1";
+   }
+diff --git a/clang/test/CodeGen/AArch64/aarch64-gnu-ilp32.c b/clang/test/CodeGen/AArch64/aarch64-gnu-ilp32.c
+index b71b3f7c0..50d6026f8 100644
+--- a/clang/test/CodeGen/AArch64/aarch64-gnu-ilp32.c
++++ b/clang/test/CodeGen/AArch64/aarch64-gnu-ilp32.c
+@@ -2,14 +2,18 @@
+ // RUN:   | FileCheck --check-prefixes=CHECK,LE --implicit-check-not=_LP64 %s
+ // RUN: %clang_cc1 -E -dM -ffreestanding -triple=aarch64_be-linux-gnu_ilp32 < /dev/null \
+ // RUN:   | FileCheck --check-prefixes=CHECK,BE --implicit-check-not=_LP64 %s
++// RUN: %clang_cc1 -E -dM -ffreestanding -triple=aarch64-linux-musl_ilp32 < /dev/null \
++// RUN:   | FileCheck --check-prefixes=CHECK,LE --implicit-check-not=_LP64 %s
+ // RUN: %clang_cc1 -triple=aarch64-linux-gnu_ilp32 -emit-llvm -o - %s \
+ // RUN:   | FileCheck --check-prefix=IR-LE %s
++// RUN: %clang_cc1 -triple=aarch64-linux-musl_ilp32 -emit-llvm -o - %s \
++// RUN:   | FileCheck --check-prefix=IR-MUSL %s
+ // RUN: %clang_cc1 -triple=aarch64_be-linux-gnu_ilp32 -emit-llvm -o - %s \
+ // RUN:   | FileCheck --check-prefix=IR-BE %s
+ 
+-// The GNU ILP32 data model, as used by GCC with -mabi=ilp32: 32-bit long and
+-// pointers, 64-bit long long, and the same types as GCC for the standard
+-// typedefs.
++// The GNU ILP32 data model, as used by GCC with -mabi=ilp32 (with glibc or
++// musl): 32-bit long and pointers, 64-bit long long, and the same types as GCC
++// for the standard typedefs.
+ 
+ // CHECK-DAG: #define _ILP32 1
+ // CHECK-DAG: #define __ILP32__ 1
+@@ -41,6 +45,8 @@
+ // IR-LE: target datalayout = "e-m:e-p:32:32-
+ // IR-LE: target triple = "aarch64-unknown-linux-gnu_ilp32"
+ // IR-BE: target datalayout = "E-m:e-p:32:32-
++// IR-MUSL: target datalayout = "e-m:e-p:32:32-
++// IR-MUSL: target triple = "aarch64-unknown-linux-musl_ilp32"
+ // IR-BE: target triple = "aarch64_be-unknown-linux-gnu_ilp32"
+ 
+ // IR-LE: @p = global ptr null, align 4
+diff --git a/clang/test/Driver/Inputs/aarch64_openwrt_musl_ilp32_tree/include/.keep b/clang/test/Driver/Inputs/aarch64_openwrt_musl_ilp32_tree/include/.keep
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/clang/test/Driver/Inputs/aarch64_openwrt_musl_ilp32_tree/lib/crt1.o b/clang/test/Driver/Inputs/aarch64_openwrt_musl_ilp32_tree/lib/crt1.o
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/clang/test/Driver/Inputs/aarch64_openwrt_musl_ilp32_tree/lib/crti.o b/clang/test/Driver/Inputs/aarch64_openwrt_musl_ilp32_tree/lib/crti.o
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/clang/test/Driver/Inputs/aarch64_openwrt_musl_ilp32_tree/lib/crtn.o b/clang/test/Driver/Inputs/aarch64_openwrt_musl_ilp32_tree/lib/crtn.o
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/clang/test/Driver/Inputs/aarch64_openwrt_musl_ilp32_tree/lib/gcc/aarch64-openwrt-linux-musl_ilp32/14.3.0/crtbegin.o b/clang/test/Driver/Inputs/aarch64_openwrt_musl_ilp32_tree/lib/gcc/aarch64-openwrt-linux-musl_ilp32/14.3.0/crtbegin.o
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/clang/test/Driver/Inputs/aarch64_openwrt_musl_ilp32_tree/lib/gcc/aarch64-openwrt-linux-musl_ilp32/14.3.0/crtend.o b/clang/test/Driver/Inputs/aarch64_openwrt_musl_ilp32_tree/lib/gcc/aarch64-openwrt-linux-musl_ilp32/14.3.0/crtend.o
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/clang/test/Driver/aarch64-musl-ilp32.c b/clang/test/Driver/aarch64-musl-ilp32.c
+new file mode 100644
+index 000000000..9d1453951
+--- /dev/null
++++ b/clang/test/Driver/aarch64-musl-ilp32.c
+@@ -0,0 +1,39 @@
++// Check the driver support for the AArch64 ILP32 ABI with musl, laid out like an
++// OpenWrt aarch64-openwrt-linux-musl_ilp32 GCC toolchain (libraries in lib).
++
++// RUN: %clang -### %s --target=aarch64-openwrt-linux-musl_ilp32 -no-pie \
++// RUN:     --gcc-toolchain=%S/Inputs/aarch64_openwrt_musl_ilp32_tree \
++// RUN:     --sysroot=%S/Inputs/aarch64_openwrt_musl_ilp32_tree \
++// RUN:     -rtlib=platform --unwindlib=platform 2>&1 \
++// RUN:   | FileCheck %s --check-prefix=ILP32
++// RUN: %clang -### %s --target=aarch64-openwrt-linux-musl -mabi=ilp32 -no-pie \
++// RUN:     --gcc-toolchain=%S/Inputs/aarch64_openwrt_musl_ilp32_tree \
++// RUN:     --sysroot=%S/Inputs/aarch64_openwrt_musl_ilp32_tree \
++// RUN:     -rtlib=platform --unwindlib=platform 2>&1 \
++// RUN:   | FileCheck %s --check-prefix=ILP32
++// ILP32: "-cc1" "-triple" "aarch64-openwrt-linux-musl_ilp32"
++// ILP32-SAME: "-target-abi" "aapcs"
++// ILP32: "--sysroot=[[SYSROOT:[^"]+]]"
++// ILP32-SAME: "-m" "aarch64linux32"
++// ILP32-SAME: "-dynamic-linker" "/lib/ld-musl-aarch64_ilp32.so.1"
++// ILP32-SAME: "[[SYSROOT]]/lib{{/|\\\\}}crt1.o"
++// ILP32-SAME: "[[SYSROOT]]/lib/gcc/aarch64-openwrt-linux-musl_ilp32/14.3.0{{/|\\\\}}crtbegin.o"
++// ILP32-SAME: "-L[[SYSROOT]]/lib/gcc/aarch64-openwrt-linux-musl_ilp32/14.3.0"
++// ILP32-SAME: "-L[[SYSROOT]]/lib"
++
++// RUN: %clang -### %s --target=aarch64_be-openwrt-linux-musl_ilp32 -no-pie \
++// RUN:     --sysroot=%S/Inputs/aarch64_openwrt_musl_ilp32_tree \
++// RUN:     -rtlib=platform --unwindlib=platform 2>&1 \
++// RUN:   | FileCheck %s --check-prefix=ILP32BE
++// ILP32BE: "-cc1" "-triple" "aarch64_be-openwrt-linux-musl_ilp32"
++// ILP32BE: "-m" "aarch64linux32b"
++// ILP32BE-SAME: "-dynamic-linker" "/lib/ld-musl-aarch64_be_ilp32.so.1"
++
++// -mabi=lp64 selects the LP64 ABI again.
++// RUN: %clang -### %s --target=aarch64-openwrt-linux-musl_ilp32 -mabi=lp64 -no-pie \
++// RUN:     --sysroot=%S/Inputs/aarch64_openwrt_musl_ilp32_tree \
++// RUN:     -rtlib=platform --unwindlib=platform 2>&1 \
++// RUN:   | FileCheck %s --check-prefix=LP64
++// LP64: "-cc1" "-triple" "aarch64-openwrt-linux-musl"
++// LP64: "-m" "aarch64linux"
++// LP64-SAME: "-dynamic-linker" "/lib/ld-musl-aarch64.so.1"
+diff --git a/llvm/include/llvm/TargetParser/Triple.h b/llvm/include/llvm/TargetParser/Triple.h
+index 9c83abeeb..026fdbaed 100644
+--- a/llvm/include/llvm/TargetParser/Triple.h
++++ b/llvm/include/llvm/TargetParser/Triple.h
+@@ -282,6 +282,7 @@ public:
+     MuslF32,
+     MuslSF,
+     MuslX32,
++    MuslILP32,
+     MuslWALI,
+     LLVM,
+ 
+@@ -867,6 +868,7 @@ public:
+            getEnvironment() == Triple::MuslF32 ||
+            getEnvironment() == Triple::MuslSF ||
+            getEnvironment() == Triple::MuslX32 ||
++           getEnvironment() == Triple::MuslILP32 ||
+            getEnvironment() == Triple::MuslWALI ||
+            getEnvironment() == Triple::OpenHOS || isOSLiteOS();
+   }
+@@ -1041,8 +1043,7 @@ public:
+     assert(PointerWidth == 64 || PointerWidth == 32);
+     if (!isAArch64())
+       return false;
+-    return getArch() == Triple::aarch64_32 ||
+-                   getEnvironment() == Triple::GNUILP32
++    return getArch() == Triple::aarch64_32 || isILP32Environment()
+                ? PointerWidth == 32
+                : PointerWidth == 64;
+   }
+@@ -1177,6 +1178,13 @@ public:
+     return Env == Triple::GNUX32 || Env == Triple::MuslX32;
+   }
+ 
++  /// Tests whether the target uses the AArch64 Linux ILP32 ABI (32-bit long
++  /// and pointers, as GCC's -mabi=ilp32), with glibc or musl.
++  bool isILP32Environment() const {
++    EnvironmentType Env = getEnvironment();
++    return Env == Triple::GNUILP32 || Env == Triple::MuslILP32;
++  }
++
+   /// Tests whether the target is eBPF.
+   bool isBPF() const {
+     return getArch() == Triple::bpfel || getArch() == Triple::bpfeb;
+diff --git a/llvm/lib/CodeGen/TargetLoweringObjectFileImpl.cpp b/llvm/lib/CodeGen/TargetLoweringObjectFileImpl.cpp
+index 6bbad68c2..7de3d6c37 100644
+--- a/llvm/lib/CodeGen/TargetLoweringObjectFileImpl.cpp
++++ b/llvm/lib/CodeGen/TargetLoweringObjectFileImpl.cpp
+@@ -190,7 +190,7 @@ void TargetLoweringObjectFileELF::Initialize(MCContext &Ctx,
+     //
+     // Use DW_EH_PE_indirect even for -fno-pic to avoid copy relocations.
+     LSDAEncoding = dwarf::DW_EH_PE_pcrel |
+-                   (TgtM.getTargetTriple().getEnvironment() == Triple::GNUILP32
++                   (TgtM.getTargetTriple().isILP32Environment()
+                         ? dwarf::DW_EH_PE_sdata4
+                         : dwarf::DW_EH_PE_sdata8);
+     PersonalityEncoding = LSDAEncoding | dwarf::DW_EH_PE_indirect;
+diff --git a/llvm/lib/Target/AArch64/AArch64Subtarget.h b/llvm/lib/Target/AArch64/AArch64Subtarget.h
+index 389b6b69b..e3f735e41 100644
+--- a/llvm/lib/Target/AArch64/AArch64Subtarget.h
++++ b/llvm/lib/Target/AArch64/AArch64Subtarget.h
+@@ -316,16 +316,14 @@ public:
+   bool isTargetMachO() const { return TargetTriple.isOSBinFormatMachO(); }
+ 
+   bool isTargetILP32() const {
+-    return TargetTriple.isArch32Bit() ||
+-           TargetTriple.getEnvironment() == Triple::GNUILP32;
++    return TargetTriple.isArch32Bit() || TargetTriple.isILP32Environment();
+   }
+ 
+-  /// GNU ILP32 follows AAPCS64: the upper 32 bits of a pointer passed or
+-  /// returned in a 64-bit register (or 8-byte stack slot) are unspecified and
+-  /// the receiver zero-extends it. arm64_32 has the producer do that instead.
+-  bool isTargetGNUILP32() const {
+-    return TargetTriple.getEnvironment() == Triple::GNUILP32;
+-  }
++  /// The GNU ILP32 ABI (aarch64-*-linux-gnu_ilp32 and -musl_ilp32) follows
++  /// AAPCS64: the upper 32 bits of a pointer passed or returned in a 64-bit
++  /// register (or 8-byte stack slot) are unspecified and the receiver
++  /// zero-extends it. arm64_32 has the producer do that instead.
++  bool isTargetGNUILP32() const { return TargetTriple.isILP32Environment(); }
+ 
+   bool useAA() const override;
+ 
+diff --git a/llvm/lib/Target/AArch64/AArch64TargetMachine.cpp b/llvm/lib/Target/AArch64/AArch64TargetMachine.cpp
+index 1ec5a20cc..cd7f943e6 100644
+--- a/llvm/lib/Target/AArch64/AArch64TargetMachine.cpp
++++ b/llvm/lib/Target/AArch64/AArch64TargetMachine.cpp
+@@ -384,7 +384,7 @@ AArch64TargetMachine::AArch64TargetMachine(const Target &T, const Triple &TT,
+   // MachO/CodeModel::Large, which GlobalISel does not support.
+   if (static_cast<int>(getOptLevel()) <= EnableGlobalISelAtO &&
+       TT.getArch() != Triple::aarch64_32 &&
+-      TT.getEnvironment() != Triple::GNUILP32 &&
++      !TT.isILP32Environment() &&
+       !(getCodeModel() == CodeModel::Large && TT.isOSBinFormatMachO())) {
+     setGlobalISel(true);
+     setGlobalISelAbort(GlobalISelAbortMode::Disable);
+diff --git a/llvm/lib/Target/AArch64/AsmParser/AArch64AsmParser.cpp b/llvm/lib/Target/AArch64/AsmParser/AArch64AsmParser.cpp
+index 5ef3e2e50..b0c2aa05b 100644
+--- a/llvm/lib/Target/AArch64/AsmParser/AArch64AsmParser.cpp
++++ b/llvm/lib/Target/AArch64/AsmParser/AArch64AsmParser.cpp
+@@ -312,7 +312,7 @@ public:
+   AArch64AsmParser(const MCSubtargetInfo &STI, MCAsmParser &Parser,
+                    const MCInstrInfo &MII, const MCTargetOptions &Options)
+     : MCTargetAsmParser(Options, STI, MII) {
+-    IsILP32 = STI.getTargetTriple().getEnvironment() == Triple::GNUILP32;
++    IsILP32 = STI.getTargetTriple().isILP32Environment();
+     IsWindowsArm64EC = STI.getTargetTriple().isWindowsArm64EC();
+     MCAsmParserExtension::Initialize(Parser);
+     MCStreamer &S = getParser().getStreamer();
+diff --git a/llvm/lib/Target/AArch64/MCTargetDesc/AArch64AsmBackend.cpp b/llvm/lib/Target/AArch64/MCTargetDesc/AArch64AsmBackend.cpp
+index 1f9694cf9..5456fa29a 100644
+--- a/llvm/lib/Target/AArch64/MCTargetDesc/AArch64AsmBackend.cpp
++++ b/llvm/lib/Target/AArch64/MCTargetDesc/AArch64AsmBackend.cpp
+@@ -795,7 +795,7 @@ MCAsmBackend *llvm::createAArch64leAsmBackend(const Target &T,
+   assert(TheTriple.isOSBinFormatELF() && "Invalid target");
+ 
+   uint8_t OSABI = MCELFObjectTargetWriter::getOSABI(TheTriple.getOS());
+-  bool IsILP32 = STI.getTargetTriple().getEnvironment() == Triple::GNUILP32;
++  bool IsILP32 = STI.getTargetTriple().isILP32Environment();
+   return new ELFAArch64AsmBackend(T, TheTriple, OSABI, /*IsLittleEndian=*/true,
+                                   IsILP32);
+ }
+@@ -808,7 +808,7 @@ MCAsmBackend *llvm::createAArch64beAsmBackend(const Target &T,
+   assert(TheTriple.isOSBinFormatELF() &&
+          "Big endian is only supported for ELF targets!");
+   uint8_t OSABI = MCELFObjectTargetWriter::getOSABI(TheTriple.getOS());
+-  bool IsILP32 = STI.getTargetTriple().getEnvironment() == Triple::GNUILP32;
++  bool IsILP32 = STI.getTargetTriple().isILP32Environment();
+   return new ELFAArch64AsmBackend(T, TheTriple, OSABI, /*IsLittleEndian=*/false,
+                                   IsILP32);
+ }
+diff --git a/llvm/lib/Target/AArch64/MCTargetDesc/AArch64MCAsmInfo.cpp b/llvm/lib/Target/AArch64/MCTargetDesc/AArch64MCAsmInfo.cpp
+index bc090c615..3592dd62a 100644
+--- a/llvm/lib/Target/AArch64/MCTargetDesc/AArch64MCAsmInfo.cpp
++++ b/llvm/lib/Target/AArch64/MCTargetDesc/AArch64MCAsmInfo.cpp
+@@ -201,7 +201,7 @@ AArch64MCAsmInfoELF::AArch64MCAsmInfoELF(const Triple &T) {
+   // targeting ELF.
+   AssemblerDialect = AsmWriterVariant == Default ? Generic : AsmWriterVariant;
+ 
+-  CodePointerSize = T.getEnvironment() == Triple::GNUILP32 ? 4 : 8;
++  CodePointerSize = T.isILP32Environment() ? 4 : 8;
+ 
+   // ".comm align is in bytes but .align is pow-2."
+   AlignmentIsInBytes = false;
+diff --git a/llvm/lib/Target/AArch64/MCTargetDesc/AArch64MCCodeEmitter.cpp b/llvm/lib/Target/AArch64/MCTargetDesc/AArch64MCCodeEmitter.cpp
+index 21ff55e9d..7149fee63 100644
+--- a/llvm/lib/Target/AArch64/MCTargetDesc/AArch64MCCodeEmitter.cpp
++++ b/llvm/lib/Target/AArch64/MCTargetDesc/AArch64MCCodeEmitter.cpp
+@@ -731,7 +731,7 @@ void AArch64MCCodeEmitter::encodeInstruction(const MCInst &MI,
+     // This is a directive which applies an R_AARCH64_TLSDESC_CALL to the
+     // following (BLR) instruction. It doesn't emit any code itself so it
+     // doesn't go through the normal TableGenerated channels.
+-    auto Reloc = STI.getTargetTriple().getEnvironment() == Triple::GNUILP32
++    auto Reloc = STI.getTargetTriple().isILP32Environment()
+                      ? ELF::R_AARCH64_P32_TLSDESC_CALL
+                      : ELF::R_AARCH64_TLSDESC_CALL;
+     addFixup(Fixups, 0, MI.getOperand(0).getExpr(), Reloc);
+diff --git a/llvm/lib/TargetParser/TargetDataLayout.cpp b/llvm/lib/TargetParser/TargetDataLayout.cpp
+index b8c3b4325..1b08d555a 100644
+--- a/llvm/lib/TargetParser/TargetDataLayout.cpp
++++ b/llvm/lib/TargetParser/TargetDataLayout.cpp
+@@ -92,7 +92,7 @@ static std::string computeAArch64DataLayout(const Triple &TT) {
+     return "e-m:w-p270:32:32-p271:32:32-p272:64:64-p:64:64-i32:32-i64:64-i128:"
+            "128-n32:64-S128-Fn32";
+   std::string Endian = TT.isLittleEndian() ? "e" : "E";
+-  std::string Ptr32 = TT.getEnvironment() == Triple::GNUILP32 ? "-p:32:32" : "";
++  std::string Ptr32 = TT.isILP32Environment() ? "-p:32:32" : "";
+   return Endian + "-m:e" + Ptr32 +
+          "-p270:32:32-p271:32:32-p272:64:64-i8:8:32-i16:16:32-i64:64-i128:128-"
+          "n32:64-S128-Fn32";
+diff --git a/llvm/lib/TargetParser/Triple.cpp b/llvm/lib/TargetParser/Triple.cpp
+index a4f9dd42c..c8273739a 100644
+--- a/llvm/lib/TargetParser/Triple.cpp
++++ b/llvm/lib/TargetParser/Triple.cpp
+@@ -378,6 +378,8 @@ StringRef Triple::getEnvironmentTypeName(EnvironmentType Kind) {
+     return "muslabi64";
+   case MuslEABI: return "musleabi";
+   case MuslEABIHF: return "musleabihf";
++  case MuslILP32:
++    return "musl_ilp32";
+   case MuslF32:
+     return "muslf32";
+   case MuslSF:
+@@ -783,6 +785,7 @@ static Triple::EnvironmentType parseEnvironment(StringRef EnvironmentName) {
+       .StartsWith("muslf32", Triple::MuslF32)
+       .StartsWith("muslsf", Triple::MuslSF)
+       .StartsWith("muslx32", Triple::MuslX32)
++      .StartsWith("musl_ilp32", Triple::MuslILP32)
+       .StartsWith("muslwali", Triple::MuslWALI)
+       .StartsWith("musl", Triple::Musl)
+       .StartsWith("msvc", Triple::MSVC)
+diff --git a/llvm/test/CodeGen/AArch64/ilp32-gnu-pointer-extend.ll b/llvm/test/CodeGen/AArch64/ilp32-gnu-pointer-extend.ll
+index 36b6d8850..68a90b0d7 100644
+--- a/llvm/test/CodeGen/AArch64/ilp32-gnu-pointer-extend.ll
++++ b/llvm/test/CodeGen/AArch64/ilp32-gnu-pointer-extend.ll
+@@ -1,12 +1,14 @@
+ ; NOTE: Assertions have been autogenerated by utils/update_llc_test_checks.py
+ ; RUN: llc -mtriple=aarch64-linux-gnu_ilp32 < %s | FileCheck %s --check-prefix=GNU
++; RUN: llc -mtriple=aarch64-linux-musl_ilp32 < %s | FileCheck %s --check-prefix=GNU
+ ; RUN: llc -mtriple=aarch64_be-linux-gnu_ilp32 < %s | FileCheck %s --check-prefix=GNUBE
+ ; RUN: llc -mtriple=arm64_32-apple-ios7.0 < %s | FileCheck %s --check-prefix=DARWIN
+ 
+-; GNU ILP32 follows AAPCS64: the upper 32 bits of a pointer passed or returned
+-; in an X register or an 8-byte stack slot are unspecified (GCC leaves them
+-; as they are and zero-extends on receipt), so the receiver has to clear them
+-; before using the pointer as an address. arm64_32 has the producer do it.
++; GNU ILP32 (glibc or musl) follows AAPCS64: the upper 32 bits of a pointer
++; passed or returned in an X register or an 8-byte stack slot are unspecified
++; (GCC leaves them as they are and zero-extends on receipt), so the receiver
++; has to clear them before using the pointer as an address. arm64_32 has the
++; producer do it.
+ 
+ declare ptr @give()
+ declare void @take(ptr)
+diff --git a/llvm/test/MC/AArch64/arm64-ilp32.s b/llvm/test/MC/AArch64/arm64-ilp32.s
+index 7de114e87..e9436f58c 100644
+--- a/llvm/test/MC/AArch64/arm64-ilp32.s
++++ b/llvm/test/MC/AArch64/arm64-ilp32.s
+@@ -1,5 +1,7 @@
+ // RUN: llvm-mc -triple aarch64-non-linux-gnu_ilp32 -filetype=obj \
+ // RUN:  %s | llvm-objdump -r - | FileCheck --check-prefix=CHECK-ILP32 %s
++// RUN: llvm-mc -triple aarch64-non-linux-musl_ilp32 -filetype=obj \
++// RUN:  %s | llvm-objdump -r - | FileCheck --check-prefix=CHECK-ILP32 %s
+ // RUN: llvm-mc -triple aarch64-non-linux-gnu -filetype=obj \
+ // RUN:  %s | llvm-objdump -r - | FileCheck --check-prefix=CHECK-LP64 %s
+ 	.text
+diff --git a/llvm/unittests/TargetParser/TripleTest.cpp b/llvm/unittests/TargetParser/TripleTest.cpp
+index b2e498ee1..a1ed857d7 100644
+--- a/llvm/unittests/TargetParser/TripleTest.cpp
++++ b/llvm/unittests/TargetParser/TripleTest.cpp
+@@ -121,6 +121,32 @@ TEST(TripleTest, ParsedIDs) {
+   EXPECT_EQ(Triple::Linux, T.getOS());
+   EXPECT_EQ(Triple::MuslX32, T.getEnvironment());
+ 
++  T = Triple("aarch64-unknown-linux-gnu_ilp32");
++  EXPECT_EQ(Triple::aarch64, T.getArch());
++  EXPECT_EQ(Triple::Linux, T.getOS());
++  EXPECT_EQ(Triple::GNUILP32, T.getEnvironment());
++  EXPECT_TRUE(T.isILP32Environment());
++  EXPECT_TRUE(T.isAArch64(32));
++  EXPECT_FALSE(T.isMusl());
++
++  T = Triple("aarch64-openwrt-linux-musl_ilp32");
++  EXPECT_EQ(Triple::aarch64, T.getArch());
++  EXPECT_EQ(Triple::Linux, T.getOS());
++  EXPECT_EQ(Triple::MuslILP32, T.getEnvironment());
++  EXPECT_TRUE(T.isILP32Environment());
++  EXPECT_TRUE(T.isAArch64(32));
++  EXPECT_TRUE(T.isMusl());
++  EXPECT_EQ("musl_ilp32", T.getEnvironmentName());
++
++  T = Triple("aarch64_be-unknown-linux-musl_ilp32");
++  EXPECT_EQ(Triple::aarch64_be, T.getArch());
++  EXPECT_EQ(Triple::MuslILP32, T.getEnvironment());
++
++  T = Triple("aarch64-unknown-linux-musl");
++  EXPECT_EQ(Triple::Musl, T.getEnvironment());
++  EXPECT_FALSE(T.isILP32Environment());
++  EXPECT_TRUE(T.isAArch64(64));
++
+   T = Triple("x86_64-pc-hurd-gnu");
+   EXPECT_EQ(Triple::x86_64, T.getArch());
+   EXPECT_EQ(Triple::PC, T.getVendor());
+-- 
+2.43.0
+

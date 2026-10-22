@@ -1,0 +1,719 @@
+From 0ae89dffb6a35b805a649274347435fbb600de5f Mon Sep 17 00:00:00 2001
+From: liviyifan <344781483+liviyifan@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 21:35:16 +0800
+Subject: [PATCH 10/10] [AArch64] GNU ILP32: fold small offsets of wrapping
+ addresses
+
+A GEP without inbounds computes its address modulo 2^32, so a load or store
+uses zext(Base + C) and cannot use an immediate offset: "add wN, wM, #C"
+then "[xN]". Use zext(Base) + C instead when C is a constant of less than a
+page, also for zext(Base + C1) + C2 when the outer offset (for example from
+narrowing a load to the byte holding a flag) does not have the opposite sign
+and |C1 + C2| is less than a page. The addresses differ only when Base is
+within |C1| of 0 or 2^32: for C1 > 0 both are unmapped on Linux (the first
+page, and the space above the 4 GiB address space of an ILP32 process), so
+both accesses fault; for C1 < 0 Base is in the first page and not a valid
+pointer. GCC folds such offsets the same way.
+
+The fold is done on Linux only, for simple unindexed loads and stores, when
+extending Base is free or replaces the 32-bit address computation. It can
+be disabled with -aarch64-ilp32-fold-address-offsets=false.
+
+Such GEPs come from LSR, from ArgumentPromotion (at -O3 it moves field
+loads to the callers without inbounds) and from InstCombine. With
+-fno-strict-overflow (pointer wrap) every GEP is one.
+
+SQLite amalgamation, -O2 -fwrapv: 235579 -> 234151 instructions (ILP32 vs
+LP64 gap 2.04% -> 1.43%); with -fno-strict-overflow 278803 -> 237215.
+CPython 3.14 (-O3, tail-calling interpreter): 731977 -> 719029 instructions.
+
+Signed-off-by: liviyifan <344781483+liviyifan@users.noreply.github.com>
+---
+ .../Target/AArch64/AArch64ISelLowering.cpp    | 103 ++++
+ .../AArch64/ilp32-gnu-address-offset-fold.ll  | 544 ++++++++++++++++++
+ 2 files changed, 647 insertions(+)
+ create mode 100644 llvm/test/CodeGen/AArch64/ilp32-gnu-address-offset-fold.ll
+
+diff --git a/llvm/lib/Target/AArch64/AArch64ISelLowering.cpp b/llvm/lib/Target/AArch64/AArch64ISelLowering.cpp
+index ccfaab579..dac367d35 100644
+--- a/llvm/lib/Target/AArch64/AArch64ISelLowering.cpp
++++ b/llvm/lib/Target/AArch64/AArch64ISelLowering.cpp
+@@ -125,6 +125,12 @@ EnableOptimizeLogicalImm("aarch64-enable-logical-imm", cl::Hidden,
+                                   "optimization"),
+                          cl::init(true));
+ 
++static cl::opt<bool> FoldILP32AddressOffsets(
++    "aarch64-ilp32-fold-address-offsets", cl::Hidden, cl::init(true),
++    cl::desc("GNU ILP32: fold constant offsets of less than a page into the "
++             "address of a load or store even if the 32-bit address "
++             "computation may wrap"));
++
+ // Temporary option added for the purpose of testing functionality added
+ // to DAGCombiner.cpp in D92230. It is expected that this can be removed
+ // in future when both implementations will be based off MGATHER rather
+@@ -24936,6 +24942,99 @@ static SDValue combineV3I8LoadExt(LoadSDNode *LD, SelectionDAG &DAG) {
+   return DAG.getMergeValues({Extract, TokenFactor}, DL);
+ }
+ 
++/// Whether a 32-bit value is produced by an instruction that writes a W
++/// register, so that zero-extending it to 64 bits is free (as isDef32 in
++/// AArch64ISelDAGToDAG.cpp).
++static bool isDef32(SDValue N) {
++  unsigned Opc = N.getOpcode();
++  return N.getValueType() == MVT::i32 && Opc != ISD::TRUNCATE &&
++         Opc != TargetOpcode::EXTRACT_SUBREG && Opc != ISD::CopyFromReg &&
++         Opc != ISD::AssertSext && Opc != ISD::AssertZext &&
++         Opc != ISD::AssertAlign && Opc != ISD::FREEZE;
++}
++
++/// Whether every use of Ptr is as the address of a simple load or store.
++static bool isOnlyUsedAsAddress(SDValue Ptr) {
++  for (SDUse &U : Ptr->uses()) {
++    auto *Mem = dyn_cast<LSBaseSDNode>(U.getUser());
++    if (!Mem || !Mem->isSimple() || !Mem->isUnindexed() ||
++        U.getOperandNo() != (isa<StoreSDNode>(Mem) ? 2u : 1u))
++      return false;
++  }
++  return true;
++}
++
++/// GNU ILP32 on Linux: a load or store address computed modulo 2^32,
++/// zext(Base + C1) + C2, is replaced by zext(Base) + (C1 + C2), which the
++/// addressing modes can absorb, when C1 and C2 are constants that do not have
++/// opposite signs and |C1 + C2| is less than a page. C2, usually 0, is added
++/// after the extension, e.g. by load narrowing. The two addresses differ only
++/// when Base is within |C1| of 0 or 2^32: for C1 > 0 both are unmapped (the
++/// first page, and the space above the 4 GiB address space of an ILP32
++/// process), so both accesses fault; for C1 < 0 Base is in the first page and
++/// not a valid pointer. GCC folds such offsets the same way.
++static SDValue foldILP32AddressOffset(SDNode *N,
++                                      TargetLowering::DAGCombinerInfo &DCI,
++                                      SelectionDAG &DAG,
++                                      const AArch64Subtarget *Subtarget) {
++  if (!FoldILP32AddressOffsets || !Subtarget->isTargetGNUILP32() ||
++      !Subtarget->isTargetLinux())
++    return SDValue();
++  auto *Mem = cast<LSBaseSDNode>(N);
++  if (!Mem->isSimple() || !Mem->isUnindexed())
++    return SDValue();
++  SDValue Ptr = Mem->getBasePtr();
++  SDValue Ext = Ptr;
++  int64_t OuterOffset = 0;
++  if (DAG.isBaseWithConstantOffset(Ptr)) {
++    Ext = Ptr.getOperand(0);
++    OuterOffset = cast<ConstantSDNode>(Ptr.getOperand(1))->getSExtValue();
++  }
++  if (Ext.getOpcode() != ISD::ZERO_EXTEND || Ext.getValueType() != MVT::i64)
++    return SDValue();
++  SDValue Addr = Ext.getOperand(0);
++  if (Addr.getValueType() != MVT::i32 || !DAG.isBaseWithConstantOffset(Addr))
++    return SDValue();
++  int64_t InnerOffset =
++      cast<ConstantSDNode>(Addr.getOperand(1))->getSExtValue();
++  if (OuterOffset <= -4096 || OuterOffset >= 4096 ||
++      (InnerOffset < 0 && OuterOffset > 0) ||
++      (InnerOffset > 0 && OuterOffset < 0))
++    return SDValue();
++  int64_t Offset = InnerOffset + OuterOffset;
++  if (Offset <= -4096 || Offset >= 4096)
++    return SDValue();
++
++  SDLoc DL(N);
++  SDValue Base = Addr.getOperand(0);
++  SDValue Base64;
++  if (Base.getOpcode() == ISD::TRUNCATE &&
++      Base.getOperand(0).getValueType() == MVT::i64 &&
++      DAG.computeKnownBits(Base.getOperand(0)).countMinLeadingZeros() >= 32)
++    Base64 = Base.getOperand(0);
++  else if (isDef32(Base) ||
++           (Addr.hasOneUse() && (Ext == Ptr || Ext.hasOneUse()) &&
++            isOnlyUsedAsAddress(Ptr)))
++    // Free, or paid for by the 32-bit address computation that goes away.
++    Base64 = DAG.getNode(ISD::ZERO_EXTEND, DL, MVT::i64, Base);
++  else
++    return SDValue();
++  SDValue NewPtr = DAG.getNode(ISD::ADD, DL, MVT::i64, Base64,
++                               DAG.getSignedConstant(Offset, DL, MVT::i64));
++
++  if (auto *LD = dyn_cast<LoadSDNode>(N)) {
++    SDValue NewLD = DAG.getLoad(ISD::UNINDEXED, LD->getExtensionType(),
++                                LD->getValueType(0), DL, LD->getChain(), NewPtr,
++                                LD->getOffset(), LD->getMemoryVT(),
++                                LD->getMemOperand());
++    return DCI.CombineTo(N, NewLD, NewLD.getValue(1));
++  }
++  auto *ST = cast<StoreSDNode>(N);
++  return DAG.getStore(ST->getChain(), DL, ST->getValue(), NewPtr,
++                      ST->getOffset(), ST->getMemoryVT(), ST->getMemOperand(),
++                      ISD::UNINDEXED, ST->isTruncatingStore());
++}
++
+ // Perform TBI simplification if supported by the target and try to break up
+ // nontemporal loads larger than 256-bits loads for odd types so LDNPQ 256-bit
+ // load instructions can be selected.
+@@ -28542,8 +28641,12 @@ SDValue AArch64TargetLowering::PerformDAGCombine(SDNode *N,
+   case ISD::SETCC:
+     return performSETCCCombine(N, DCI, DAG);
+   case ISD::LOAD:
++    if (SDValue Res = foldILP32AddressOffset(N, DCI, DAG, Subtarget))
++      return Res;
+     return performLOADCombine(N, DCI, DAG, Subtarget);
+   case ISD::STORE:
++    if (SDValue Res = foldILP32AddressOffset(N, DCI, DAG, Subtarget))
++      return Res;
+     return performSTORECombine(N, DCI, DAG, Subtarget);
+   case ISD::MSTORE:
+     return performMSTORECombine(N, DCI, DAG, Subtarget);
+diff --git a/llvm/test/CodeGen/AArch64/ilp32-gnu-address-offset-fold.ll b/llvm/test/CodeGen/AArch64/ilp32-gnu-address-offset-fold.ll
+new file mode 100644
+index 000000000..fa3068dff
+--- /dev/null
++++ b/llvm/test/CodeGen/AArch64/ilp32-gnu-address-offset-fold.ll
+@@ -0,0 +1,544 @@
++; NOTE: Assertions have been autogenerated by utils/update_llc_test_checks.py
++; RUN: llc -mtriple=aarch64-linux-gnu_ilp32 < %s | FileCheck %s --check-prefix=FOLD
++; RUN: llc -mtriple=aarch64-linux-musl_ilp32 < %s | FileCheck %s --check-prefix=FOLD
++; RUN: llc -mtriple=aarch64_be-linux-gnu_ilp32 < %s | FileCheck %s --check-prefix=FOLDBE
++; RUN: llc -mtriple=aarch64-linux-gnu_ilp32 -aarch64-ilp32-fold-address-offsets=false < %s \
++; RUN:   | FileCheck %s --check-prefix=NOFOLD
++; The fold relies on the Linux address space layout.
++; RUN: llc -mtriple=aarch64-unknown-none-gnu_ilp32 < %s | FileCheck %s --check-prefix=NOFOLD
++
++; GNU ILP32 on Linux: an address computed modulo 2^32 by a GEP without inbounds,
++; zext(Base + C1) + C2, is used as zext(Base) + (C1 + C2) when C1 and C2 do not
++; have opposite signs and |C1 + C2| is less than a page: the two differ only for
++; a Base within |C1| of 0 or 4 GiB, where the access faults either way (C1 > 0)
++; or Base is not a valid pointer (C1 < 0). Pointers read from other blocks are
++; known to be zero-extended, so that loop bases are free.
++
++
++; base: a pointer argument (zero-extended on entry)
++define i32 @arg_pos(ptr %b) {
++; FOLD-LABEL: arg_pos:
++; FOLD:       // %bb.0:
++; FOLD-NEXT:    mov w8, w0
++; FOLD-NEXT:    ldr w0, [x8, #12]
++; FOLD-NEXT:    ret
++;
++; FOLDBE-LABEL: arg_pos:
++; FOLDBE:       // %bb.0:
++; FOLDBE-NEXT:    mov w8, w0
++; FOLDBE-NEXT:    ldr w0, [x8, #12]
++; FOLDBE-NEXT:    ret
++;
++; NOFOLD-LABEL: arg_pos:
++; NOFOLD:       // %bb.0:
++; NOFOLD-NEXT:    add w8, w0, #12
++; NOFOLD-NEXT:    ldr w0, [x8]
++; NOFOLD-NEXT:    ret
++  %p = getelementptr i8, ptr %b, i32 12
++  %v = load i32, ptr %p
++  ret i32 %v
++}
++
++define i32 @arg_neg(ptr %b) {
++; FOLD-LABEL: arg_neg:
++; FOLD:       // %bb.0:
++; FOLD-NEXT:    mov w8, w0
++; FOLD-NEXT:    ldur w0, [x8, #-4]
++; FOLD-NEXT:    ret
++;
++; FOLDBE-LABEL: arg_neg:
++; FOLDBE:       // %bb.0:
++; FOLDBE-NEXT:    mov w8, w0
++; FOLDBE-NEXT:    ldur w0, [x8, #-4]
++; FOLDBE-NEXT:    ret
++;
++; NOFOLD-LABEL: arg_neg:
++; NOFOLD:       // %bb.0:
++; NOFOLD-NEXT:    sub w8, w0, #4
++; NOFOLD-NEXT:    ldr w0, [x8]
++; NOFOLD-NEXT:    ret
++  %p = getelementptr i8, ptr %b, i32 -4
++  %v = load i32, ptr %p
++  ret i32 %v
++}
++
++; base: a pointer loaded from memory (32-bit load, zero-extended)
++define i32 @loaded(ptr %pp) {
++; FOLD-LABEL: loaded:
++; FOLD:       // %bb.0:
++; FOLD-NEXT:    mov w8, w0
++; FOLD-NEXT:    ldr w8, [x8]
++; FOLD-NEXT:    ldr w0, [x8, #8]
++; FOLD-NEXT:    ret
++;
++; FOLDBE-LABEL: loaded:
++; FOLDBE:       // %bb.0:
++; FOLDBE-NEXT:    mov w8, w0
++; FOLDBE-NEXT:    ldr w8, [x8]
++; FOLDBE-NEXT:    ldr w0, [x8, #8]
++; FOLDBE-NEXT:    ret
++;
++; NOFOLD-LABEL: loaded:
++; NOFOLD:       // %bb.0:
++; NOFOLD-NEXT:    mov w8, w0
++; NOFOLD-NEXT:    ldr w8, [x8]
++; NOFOLD-NEXT:    add w8, w8, #8
++; NOFOLD-NEXT:    ldr w0, [x8]
++; NOFOLD-NEXT:    ret
++  %b = load ptr, ptr %pp
++  %p = getelementptr i8, ptr %b, i32 8
++  %v = load i32, ptr %p
++  ret i32 %v
++}
++
++; store to a wrapped address, and store of the wrapped address itself
++define void @store_addr_and_value(ptr %b, ptr %out) {
++; FOLD-LABEL: store_addr_and_value:
++; FOLD:       // %bb.0:
++; FOLD-NEXT:    mov w8, #7 // =0x7
++; FOLD-NEXT:    add w9, w0, #16
++; FOLD-NEXT:    mov w10, w1
++; FOLD-NEXT:    str w8, [x9]
++; FOLD-NEXT:    str w9, [x10]
++; FOLD-NEXT:    ret
++;
++; FOLDBE-LABEL: store_addr_and_value:
++; FOLDBE:       // %bb.0:
++; FOLDBE-NEXT:    mov w8, #7 // =0x7
++; FOLDBE-NEXT:    add w9, w0, #16
++; FOLDBE-NEXT:    mov w10, w1
++; FOLDBE-NEXT:    str w8, [x9]
++; FOLDBE-NEXT:    str w9, [x10]
++; FOLDBE-NEXT:    ret
++;
++; NOFOLD-LABEL: store_addr_and_value:
++; NOFOLD:       // %bb.0:
++; NOFOLD-NEXT:    mov w8, #7 // =0x7
++; NOFOLD-NEXT:    add w9, w0, #16
++; NOFOLD-NEXT:    mov w10, w1
++; NOFOLD-NEXT:    str w8, [x9]
++; NOFOLD-NEXT:    str w9, [x10]
++; NOFOLD-NEXT:    ret
++  %p = getelementptr i8, ptr %b, i32 16
++  store i32 7, ptr %p
++  store ptr %p, ptr %out
++  ret void
++}
++
++; must not change: volatile access
++define i32 @volatile_load(ptr %b) {
++; FOLD-LABEL: volatile_load:
++; FOLD:       // %bb.0:
++; FOLD-NEXT:    add w8, w0, #12
++; FOLD-NEXT:    ldr w0, [x8]
++; FOLD-NEXT:    ret
++;
++; FOLDBE-LABEL: volatile_load:
++; FOLDBE:       // %bb.0:
++; FOLDBE-NEXT:    add w8, w0, #12
++; FOLDBE-NEXT:    ldr w0, [x8]
++; FOLDBE-NEXT:    ret
++;
++; NOFOLD-LABEL: volatile_load:
++; NOFOLD:       // %bb.0:
++; NOFOLD-NEXT:    add w8, w0, #12
++; NOFOLD-NEXT:    ldr w0, [x8]
++; NOFOLD-NEXT:    ret
++  %p = getelementptr i8, ptr %b, i32 12
++  %v = load volatile i32, ptr %p
++  ret i32 %v
++}
++
++; must not change: offset of a page or more
++define i32 @big_offset(ptr %b) {
++; FOLD-LABEL: big_offset:
++; FOLD:       // %bb.0:
++; FOLD-NEXT:    add w8, w0, #1, lsl #12 // =4096
++; FOLD-NEXT:    ldr w0, [x8]
++; FOLD-NEXT:    ret
++;
++; FOLDBE-LABEL: big_offset:
++; FOLDBE:       // %bb.0:
++; FOLDBE-NEXT:    add w8, w0, #1, lsl #12 // =4096
++; FOLDBE-NEXT:    ldr w0, [x8]
++; FOLDBE-NEXT:    ret
++;
++; NOFOLD-LABEL: big_offset:
++; NOFOLD:       // %bb.0:
++; NOFOLD-NEXT:    add w8, w0, #1, lsl #12 // =4096
++; NOFOLD-NEXT:    ldr w0, [x8]
++; NOFOLD-NEXT:    ret
++  %p = getelementptr i8, ptr %b, i32 4096
++  %v = load i32, ptr %p
++  ret i32 %v
++}
++
++; must not change: variable offset
++define i32 @var_offset(ptr %b, i32 %i) {
++; FOLD-LABEL: var_offset:
++; FOLD:       // %bb.0:
++; FOLD-NEXT:    add w8, w0, w1
++; FOLD-NEXT:    ldr w0, [x8]
++; FOLD-NEXT:    ret
++;
++; FOLDBE-LABEL: var_offset:
++; FOLDBE:       // %bb.0:
++; FOLDBE-NEXT:    add w8, w0, w1
++; FOLDBE-NEXT:    ldr w0, [x8]
++; FOLDBE-NEXT:    ret
++;
++; NOFOLD-LABEL: var_offset:
++; NOFOLD:       // %bb.0:
++; NOFOLD-NEXT:    add w8, w0, w1
++; NOFOLD-NEXT:    ldr w0, [x8]
++; NOFOLD-NEXT:    ret
++  %p = getelementptr i8, ptr %b, i32 %i
++  %v = load i32, ptr %p
++  ret i32 %v
++}
++
++; a loop with a pointer induction variable, like LSR output
++define i32 @loop(ptr %a, i32 %n) {
++; FOLD-LABEL: loop:
++; FOLD:       // %bb.0: // %entry
++; FOLD-NEXT:    mov x8, x0
++; FOLD-NEXT:    mov w0, wzr
++; FOLD-NEXT:    mov w8, w8
++; FOLD-NEXT:  .LBB7_1: // %body
++; FOLD-NEXT:    // =>This Inner Loop Header: Depth=1
++; FOLD-NEXT:    ldp w9, w10, [x8, #-4]
++; FOLD-NEXT:    subs w1, w1, #1
++; FOLD-NEXT:    add w8, w8, #4
++; FOLD-NEXT:    add w9, w9, w10
++; FOLD-NEXT:    add w0, w0, w9
++; FOLD-NEXT:    b.ne .LBB7_1
++; FOLD-NEXT:  // %bb.2: // %exit
++; FOLD-NEXT:    ret
++;
++; FOLDBE-LABEL: loop:
++; FOLDBE:       // %bb.0: // %entry
++; FOLDBE-NEXT:    mov x8, x0
++; FOLDBE-NEXT:    mov w0, wzr
++; FOLDBE-NEXT:    mov w8, w8
++; FOLDBE-NEXT:  .LBB7_1: // %body
++; FOLDBE-NEXT:    // =>This Inner Loop Header: Depth=1
++; FOLDBE-NEXT:    ldp w9, w10, [x8, #-4]
++; FOLDBE-NEXT:    subs w1, w1, #1
++; FOLDBE-NEXT:    add w8, w8, #4
++; FOLDBE-NEXT:    add w9, w9, w10
++; FOLDBE-NEXT:    add w0, w0, w9
++; FOLDBE-NEXT:    b.ne .LBB7_1
++; FOLDBE-NEXT:  // %bb.2: // %exit
++; FOLDBE-NEXT:    ret
++;
++; NOFOLD-LABEL: loop:
++; NOFOLD:       // %bb.0: // %entry
++; NOFOLD-NEXT:    mov x8, x0
++; NOFOLD-NEXT:    mov w0, wzr
++; NOFOLD-NEXT:    mov w8, w8
++; NOFOLD-NEXT:  .LBB7_1: // %body
++; NOFOLD-NEXT:    // =>This Inner Loop Header: Depth=1
++; NOFOLD-NEXT:    sub w9, w8, #4
++; NOFOLD-NEXT:    ldr w10, [x8]
++; NOFOLD-NEXT:    subs w1, w1, #1
++; NOFOLD-NEXT:    ldr w9, [x9]
++; NOFOLD-NEXT:    add w8, w8, #4
++; NOFOLD-NEXT:    add w10, w0, w10
++; NOFOLD-NEXT:    add w0, w10, w9
++; NOFOLD-NEXT:    b.ne .LBB7_1
++; NOFOLD-NEXT:  // %bb.2: // %exit
++; NOFOLD-NEXT:    ret
++entry:
++  br label %body
++body:
++  %iv = phi ptr [ %a, %entry ], [ %iv.next, %body ]
++  %i = phi i32 [ 0, %entry ], [ %i.next, %body ]
++  %s = phi i32 [ 0, %entry ], [ %s.next, %body ]
++  %p0 = getelementptr i8, ptr %iv, i32 -4
++  %v0 = load i32, ptr %p0
++  %v1 = load i32, ptr %iv
++  %t = add i32 %v0, %v1
++  %s.next = add i32 %s, %t
++  %iv.next = getelementptr i8, ptr %iv, i32 4
++  %i.next = add i32 %i, 1
++  %c = icmp ne i32 %i.next, %n
++  br i1 %c, label %body, label %exit
++exit:
++  ret i32 %s.next
++}
++
++; two adjacent fields through a non-inbounds GEP: may pair into ldp
++define i32 @pair(ptr %b) {
++; FOLD-LABEL: pair:
++; FOLD:       // %bb.0:
++; FOLD-NEXT:    mov w8, w0
++; FOLD-NEXT:    ldp w9, w8, [x8, #8]
++; FOLD-NEXT:    add w0, w9, w8
++; FOLD-NEXT:    ret
++;
++; FOLDBE-LABEL: pair:
++; FOLDBE:       // %bb.0:
++; FOLDBE-NEXT:    mov w8, w0
++; FOLDBE-NEXT:    ldp w9, w8, [x8, #8]
++; FOLDBE-NEXT:    add w0, w9, w8
++; FOLDBE-NEXT:    ret
++;
++; NOFOLD-LABEL: pair:
++; NOFOLD:       // %bb.0:
++; NOFOLD-NEXT:    add w8, w0, #8
++; NOFOLD-NEXT:    add w9, w0, #12
++; NOFOLD-NEXT:    ldr w8, [x8]
++; NOFOLD-NEXT:    ldr w9, [x9]
++; NOFOLD-NEXT:    add w0, w8, w9
++; NOFOLD-NEXT:    ret
++  %p0 = getelementptr i8, ptr %b, i32 8
++  %p1 = getelementptr i8, ptr %b, i32 12
++  %v0 = load i32, ptr %p0
++  %v1 = load i32, ptr %p1
++  %s = add i32 %v0, %v1
++  ret i32 %s
++}
++
++; The largest offsets that are folded, and the smallest that are not.
++define i32 @off_4095(ptr %pp) {
++; FOLD-LABEL: off_4095:
++; FOLD:       // %bb.0:
++; FOLD-NEXT:    mov w8, w0
++; FOLD-NEXT:    ldr w8, [x8]
++; FOLD-NEXT:    add x8, x8, #4095
++; FOLD-NEXT:    ldr w0, [x8]
++; FOLD-NEXT:    ret
++;
++; FOLDBE-LABEL: off_4095:
++; FOLDBE:       // %bb.0:
++; FOLDBE-NEXT:    mov w8, w0
++; FOLDBE-NEXT:    ldr w8, [x8]
++; FOLDBE-NEXT:    add x8, x8, #4095
++; FOLDBE-NEXT:    ldr w0, [x8]
++; FOLDBE-NEXT:    ret
++;
++; NOFOLD-LABEL: off_4095:
++; NOFOLD:       // %bb.0:
++; NOFOLD-NEXT:    mov w8, w0
++; NOFOLD-NEXT:    ldr w8, [x8]
++; NOFOLD-NEXT:    add w8, w8, #4095
++; NOFOLD-NEXT:    ldr w0, [x8]
++; NOFOLD-NEXT:    ret
++  %b = load ptr, ptr %pp
++  %p = getelementptr i8, ptr %b, i32 4095
++  %v = load i32, ptr %p, align 1
++  ret i32 %v
++}
++
++define i32 @off_m4095(ptr %pp) {
++; FOLD-LABEL: off_m4095:
++; FOLD:       // %bb.0:
++; FOLD-NEXT:    mov w8, w0
++; FOLD-NEXT:    ldr w8, [x8]
++; FOLD-NEXT:    sub x8, x8, #4095
++; FOLD-NEXT:    ldr w0, [x8]
++; FOLD-NEXT:    ret
++;
++; FOLDBE-LABEL: off_m4095:
++; FOLDBE:       // %bb.0:
++; FOLDBE-NEXT:    mov w8, w0
++; FOLDBE-NEXT:    ldr w8, [x8]
++; FOLDBE-NEXT:    sub x8, x8, #4095
++; FOLDBE-NEXT:    ldr w0, [x8]
++; FOLDBE-NEXT:    ret
++;
++; NOFOLD-LABEL: off_m4095:
++; NOFOLD:       // %bb.0:
++; NOFOLD-NEXT:    mov w8, w0
++; NOFOLD-NEXT:    ldr w8, [x8]
++; NOFOLD-NEXT:    sub w8, w8, #4095
++; NOFOLD-NEXT:    ldr w0, [x8]
++; NOFOLD-NEXT:    ret
++  %b = load ptr, ptr %pp
++  %p = getelementptr i8, ptr %b, i32 -4095
++  %v = load i32, ptr %p, align 1
++  ret i32 %v
++}
++
++define i32 @off_m4096(ptr %pp) {
++; FOLD-LABEL: off_m4096:
++; FOLD:       // %bb.0:
++; FOLD-NEXT:    mov w8, w0
++; FOLD-NEXT:    ldr w8, [x8]
++; FOLD-NEXT:    sub w8, w8, #1, lsl #12 // =4096
++; FOLD-NEXT:    ldr w0, [x8]
++; FOLD-NEXT:    ret
++;
++; FOLDBE-LABEL: off_m4096:
++; FOLDBE:       // %bb.0:
++; FOLDBE-NEXT:    mov w8, w0
++; FOLDBE-NEXT:    ldr w8, [x8]
++; FOLDBE-NEXT:    sub w8, w8, #1, lsl #12 // =4096
++; FOLDBE-NEXT:    ldr w0, [x8]
++; FOLDBE-NEXT:    ret
++;
++; NOFOLD-LABEL: off_m4096:
++; NOFOLD:       // %bb.0:
++; NOFOLD-NEXT:    mov w8, w0
++; NOFOLD-NEXT:    ldr w8, [x8]
++; NOFOLD-NEXT:    sub w8, w8, #1, lsl #12 // =4096
++; NOFOLD-NEXT:    ldr w0, [x8]
++; NOFOLD-NEXT:    ret
++  %b = load ptr, ptr %pp
++  %p = getelementptr i8, ptr %b, i32 -4096
++  %v = load i32, ptr %p
++  ret i32 %v
++}
++
++; An address built with integer arithmetic: the offset is an or of disjoint bits.
++define i32 @or_disjoint(i32 %x) {
++; FOLD-LABEL: or_disjoint:
++; FOLD:       // %bb.0:
++; FOLD-NEXT:    and w8, w0, #0xfffffff0
++; FOLD-NEXT:    ldr w0, [x8, #8]
++; FOLD-NEXT:    ret
++;
++; FOLDBE-LABEL: or_disjoint:
++; FOLDBE:       // %bb.0:
++; FOLDBE-NEXT:    and w8, w0, #0xfffffff0
++; FOLDBE-NEXT:    ldr w0, [x8, #8]
++; FOLDBE-NEXT:    ret
++;
++; NOFOLD-LABEL: or_disjoint:
++; NOFOLD:       // %bb.0:
++; NOFOLD-NEXT:    and w8, w0, #0xfffffff0
++; NOFOLD-NEXT:    orr w8, w8, #0x8
++; NOFOLD-NEXT:    ldr w0, [x8]
++; NOFOLD-NEXT:    ret
++  %a = and i32 %x, -16
++  %o = or disjoint i32 %a, 8
++  %p = inttoptr i32 %o to ptr
++  %v = load i32, ptr %p
++  ret i32 %v
++}
++
++; A store to a wrapped address.
++define void @store_loaded_base(ptr %pp, i32 %v) {
++; FOLD-LABEL: store_loaded_base:
++; FOLD:       // %bb.0:
++; FOLD-NEXT:    mov w8, w0
++; FOLD-NEXT:    ldr w8, [x8]
++; FOLD-NEXT:    str w1, [x8, #24]
++; FOLD-NEXT:    ret
++;
++; FOLDBE-LABEL: store_loaded_base:
++; FOLDBE:       // %bb.0:
++; FOLDBE-NEXT:    mov w8, w0
++; FOLDBE-NEXT:    ldr w8, [x8]
++; FOLDBE-NEXT:    str w1, [x8, #24]
++; FOLDBE-NEXT:    ret
++;
++; NOFOLD-LABEL: store_loaded_base:
++; NOFOLD:       // %bb.0:
++; NOFOLD-NEXT:    mov w8, w0
++; NOFOLD-NEXT:    ldr w8, [x8]
++; NOFOLD-NEXT:    add w8, w8, #24
++; NOFOLD-NEXT:    str w1, [x8]
++; NOFOLD-NEXT:    ret
++  %b = load ptr, ptr %pp
++  %p = getelementptr i8, ptr %b, i32 24
++  store i32 %v, ptr %p
++  ret void
++}
++
++; A flag test of a field: the load is narrowed to the byte holding the flag,
++; which adds an offset after the extension.
++define i1 @narrowed_flag_load(ptr %pp) {
++; FOLD-LABEL: narrowed_flag_load:
++; FOLD:       // %bb.0:
++; FOLD-NEXT:    mov w8, w0
++; FOLD-NEXT:    ldr w8, [x8]
++; FOLD-NEXT:    ldrb w8, [x8, #85]
++; FOLD-NEXT:    ubfx w0, w8, #3, #1
++; FOLD-NEXT:    ret
++;
++; FOLDBE-LABEL: narrowed_flag_load:
++; FOLDBE:       // %bb.0:
++; FOLDBE-NEXT:    mov w8, w0
++; FOLDBE-NEXT:    ldr w8, [x8]
++; FOLDBE-NEXT:    ldrb w8, [x8, #86]
++; FOLDBE-NEXT:    ubfx w0, w8, #3, #1
++; FOLDBE-NEXT:    ret
++;
++; NOFOLD-LABEL: narrowed_flag_load:
++; NOFOLD:       // %bb.0:
++; NOFOLD-NEXT:    mov w8, w0
++; NOFOLD-NEXT:    ldr w8, [x8]
++; NOFOLD-NEXT:    add w8, w8, #84
++; NOFOLD-NEXT:    ldrb w8, [x8, #1]
++; NOFOLD-NEXT:    ubfx w0, w8, #3, #1
++; NOFOLD-NEXT:    ret
++  %b = load ptr, ptr %pp
++  %p = getelementptr i8, ptr %b, i32 84
++  %f = load i32, ptr %p
++  %m = and i32 %f, 2048
++  %c = icmp ne i32 %m, 0
++  ret i1 %c
++}
++
++; An inbounds offset from a wrapped address.
++define i32 @inbounds_after_wrapped(ptr %pp) {
++; FOLD-LABEL: inbounds_after_wrapped:
++; FOLD:       // %bb.0:
++; FOLD-NEXT:    mov w8, w0
++; FOLD-NEXT:    ldr w8, [x8]
++; FOLD-NEXT:    ldr w0, [x8, #12]
++; FOLD-NEXT:    ret
++;
++; FOLDBE-LABEL: inbounds_after_wrapped:
++; FOLDBE:       // %bb.0:
++; FOLDBE-NEXT:    mov w8, w0
++; FOLDBE-NEXT:    ldr w8, [x8]
++; FOLDBE-NEXT:    ldr w0, [x8, #12]
++; FOLDBE-NEXT:    ret
++;
++; NOFOLD-LABEL: inbounds_after_wrapped:
++; NOFOLD:       // %bb.0:
++; NOFOLD-NEXT:    mov w8, w0
++; NOFOLD-NEXT:    ldr w8, [x8]
++; NOFOLD-NEXT:    add w8, w8, #8
++; NOFOLD-NEXT:    ldr w0, [x8, #4]
++; NOFOLD-NEXT:    ret
++  %b = load ptr, ptr %pp
++  %p = getelementptr i8, ptr %b, i32 8
++  %q = getelementptr inbounds i8, ptr %p, i32 4
++  %v = load i32, ptr %q
++  ret i32 %v
++}
++
++; must not change: the second offset goes back across the first.
++define i32 @opposite_signs(ptr %pp) {
++; FOLD-LABEL: opposite_signs:
++; FOLD:       // %bb.0:
++; FOLD-NEXT:    mov w8, w0
++; FOLD-NEXT:    ldr w8, [x8]
++; FOLD-NEXT:    add w8, w8, #8
++; FOLD-NEXT:    ldur w0, [x8, #-12]
++; FOLD-NEXT:    ret
++;
++; FOLDBE-LABEL: opposite_signs:
++; FOLDBE:       // %bb.0:
++; FOLDBE-NEXT:    mov w8, w0
++; FOLDBE-NEXT:    ldr w8, [x8]
++; FOLDBE-NEXT:    add w8, w8, #8
++; FOLDBE-NEXT:    ldur w0, [x8, #-12]
++; FOLDBE-NEXT:    ret
++;
++; NOFOLD-LABEL: opposite_signs:
++; NOFOLD:       // %bb.0:
++; NOFOLD-NEXT:    mov w8, w0
++; NOFOLD-NEXT:    ldr w8, [x8]
++; NOFOLD-NEXT:    add w8, w8, #8
++; NOFOLD-NEXT:    ldur w0, [x8, #-12]
++; NOFOLD-NEXT:    ret
++  %b = load ptr, ptr %pp
++  %p = getelementptr i8, ptr %b, i32 8
++  %q = getelementptr inbounds i8, ptr %p, i32 -12
++  %v = load i32, ptr %q
++  ret i32 %v
++}
+-- 
+2.43.0
+

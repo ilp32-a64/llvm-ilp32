@@ -1,0 +1,320 @@
+From 73fe8dbf6813bcce0f2fd91c0b4d530560693d1e Mon Sep 17 00:00:00 2001
+From: liviyifan <344781483+liviyifan@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 05:57:58 +0800
+Subject: [PATCH 05/10] [AArch64] GNU ILP32: no pointer extension for LLVM-only
+ calling conventions
+
+The receiver has to zero-extend GNU ILP32 pointers only because GCC-compiled
+code may be on the other side of the call. GCC implements none of LLVM's own
+calling conventions for AArch64 (it ignores preserve_none, preserve_most and
+preserve_all, and has no fastcc, tailcc, coldcc, GHC or Swift conventions),
+so pointers passed or returned with them always come from LLVM-compiled code,
+which keeps them zero-extended. Assert the zero extension for these
+conventions as for arm64_32. The vector and SVE PCS, which GCC supports,
+keep the extension.
+
+This matters for CPython 3.14's tail-calling interpreter: its opcode
+handlers use preserve_none, are called through a dispatch table (so their
+address is taken) and each received four pointers. On ceval.c this removes
+685 of 693 "mov wN, wN" instructions from the 231 handlers (16934 instead of
+17854 instructions).
+
+Signed-off-by: liviyifan <344781483+liviyifan@users.noreply.github.com>
+---
+ .../Target/AArch64/AArch64ISelLowering.cpp    |  28 ++-
+ .../AArch64/ilp32-gnu-pointer-extend.ll       | 228 ++++++++++++++++++
+ 2 files changed, 253 insertions(+), 3 deletions(-)
+
+diff --git a/llvm/lib/Target/AArch64/AArch64ISelLowering.cpp b/llvm/lib/Target/AArch64/AArch64ISelLowering.cpp
+index c2ea4305e..ccfaab579 100644
+--- a/llvm/lib/Target/AArch64/AArch64ISelLowering.cpp
++++ b/llvm/lib/Target/AArch64/AArch64ISelLowering.cpp
+@@ -8535,6 +8535,27 @@ static bool hasOnlyLocalCallers(const Function &F) {
+   return F.hasLocalLinkage() && !F.hasAddressTaken();
+ }
+ 
++/// Whether GCC-compiled code can be on the other side of a call with this
++/// calling convention. GCC implements none of LLVM's own conventions for
++/// AArch64 (it ignores preserve_none, preserve_most and preserve_all), so
++/// pointers passed or returned with them always come from LLVM-compiled code.
++static bool mayInteroperateWithGCC(CallingConv::ID CC) {
++  switch (CC) {
++  case CallingConv::Fast:
++  case CallingConv::Cold:
++  case CallingConv::GHC:
++  case CallingConv::Tail:
++  case CallingConv::PreserveMost:
++  case CallingConv::PreserveAll:
++  case CallingConv::PreserveNone:
++  case CallingConv::Swift:
++  case CallingConv::SwiftTail:
++    return false;
++  default:
++    return true;
++  }
++}
++
+ SDValue AArch64TargetLowering::LowerFormalArguments(
+     SDValue Chain, CallingConv::ID CallConv, bool isVarArg,
+     const SmallVectorImpl<ISD::InputArg> &Ins, const SDLoc &DL,
+@@ -8807,7 +8828,7 @@ SDValue AArch64TargetLowering::LowerFormalArguments(
+       }
+     } else {
+       if (Subtarget->isTargetGNUILP32() && Ins[i].Flags.isPointer() &&
+-          !hasOnlyLocalCallers(F))
++          mayInteroperateWithGCC(CallConv) && !hasOnlyLocalCallers(F))
+         ArgValue = DAG.getZeroExtendInReg(ArgValue, DL, MVT::i32);
+       else if (Subtarget->isTargetILP32() && Ins[i].Flags.isPointer())
+         ArgValue = DAG.getNode(ISD::AssertZext, DL, ArgValue.getValueType(),
+@@ -10381,9 +10402,10 @@ AArch64TargetLowering::LowerCall(CallLoweringInfo &CLI,
+       IsThisReturn ? OutVals[0] : SDValue(), RequiresSMChange);
+ 
+   // A GNU ILP32 callee may return a pointer with garbage in the upper 32 bits,
+-  // unless it is a local function compiled here.
++  // unless it is a local function compiled here or uses a calling convention
++  // that GCC does not implement.
+   const Function *CalledFn = CLI.CB ? CLI.CB->getCalledFunction() : nullptr;
+-  if (Subtarget->isTargetGNUILP32() &&
++  if (Subtarget->isTargetGNUILP32() && mayInteroperateWithGCC(CallConv) &&
+       !(CalledFn && CalledFn->hasLocalLinkage() &&
+         !CalledFn->isDeclaration())) {
+     assert(InVals.size() == Ins.size() && "unexpected call result split");
+diff --git a/llvm/test/CodeGen/AArch64/ilp32-gnu-pointer-extend.ll b/llvm/test/CodeGen/AArch64/ilp32-gnu-pointer-extend.ll
+index 6a6da0542..36b6d8850 100644
+--- a/llvm/test/CodeGen/AArch64/ilp32-gnu-pointer-extend.ll
++++ b/llvm/test/CodeGen/AArch64/ilp32-gnu-pointer-extend.ll
+@@ -324,3 +324,231 @@ define ptr @get_escaping() {
+ }
+ 
+ @gptr = global ptr null
++
++; GCC implements none of these calling conventions for AArch64, so only
++; LLVM-compiled code, which zero-extends pointers, passes or returns pointers
++; with them: no extension, even with external linkage.
++define preserve_nonecc i32 @preserve_none_deref(ptr %p) {
++; GNU-LABEL: preserve_none_deref:
++; GNU:       // %bb.0:
++; GNU-NEXT:    ldr w0, [x20]
++; GNU-NEXT:    ret
++;
++; GNUBE-LABEL: preserve_none_deref:
++; GNUBE:       // %bb.0:
++; GNUBE-NEXT:    ldr w0, [x20]
++; GNUBE-NEXT:    ret
++;
++; DARWIN-LABEL: preserve_none_deref:
++; DARWIN:       ; %bb.0:
++; DARWIN-NEXT:    ldr w0, [x20]
++; DARWIN-NEXT:    ret
++  %v = load i32, ptr %p
++  ret i32 %v
++}
++
++define preserve_mostcc i32 @preserve_most_deref(ptr %p) {
++; GNU-LABEL: preserve_most_deref:
++; GNU:       // %bb.0:
++; GNU-NEXT:    ldr w0, [x0]
++; GNU-NEXT:    ret
++;
++; GNUBE-LABEL: preserve_most_deref:
++; GNUBE:       // %bb.0:
++; GNUBE-NEXT:    ldr w0, [x0]
++; GNUBE-NEXT:    ret
++;
++; DARWIN-LABEL: preserve_most_deref:
++; DARWIN:       ; %bb.0:
++; DARWIN-NEXT:    ldr w0, [x0]
++; DARWIN-NEXT:    ret
++  %v = load i32, ptr %p
++  ret i32 %v
++}
++
++define fastcc i32 @fast_deref(ptr %p) {
++; GNU-LABEL: fast_deref:
++; GNU:       // %bb.0:
++; GNU-NEXT:    ldr w0, [x0]
++; GNU-NEXT:    ret
++;
++; GNUBE-LABEL: fast_deref:
++; GNUBE:       // %bb.0:
++; GNUBE-NEXT:    ldr w0, [x0]
++; GNUBE-NEXT:    ret
++;
++; DARWIN-LABEL: fast_deref:
++; DARWIN:       ; %bb.0:
++; DARWIN-NEXT:    ldr w0, [x0]
++; DARWIN-NEXT:    ret
++  %v = load i32, ptr %p
++  ret i32 %v
++}
++
++declare preserve_nonecc ptr @preserve_none_give()
++
++define i32 @deref_preserve_none_returned() {
++; GNU-LABEL: deref_preserve_none_returned:
++; GNU:       // %bb.0:
++; GNU-NEXT:    stp d15, d14, [sp, #-160]! // 16-byte Folded Spill
++; GNU-NEXT:    stp d13, d12, [sp, #16] // 16-byte Folded Spill
++; GNU-NEXT:    stp d11, d10, [sp, #32] // 16-byte Folded Spill
++; GNU-NEXT:    stp d9, d8, [sp, #48] // 16-byte Folded Spill
++; GNU-NEXT:    str x30, [sp, #64] // 8-byte Spill
++; GNU-NEXT:    stp x28, x27, [sp, #80] // 16-byte Folded Spill
++; GNU-NEXT:    stp x26, x25, [sp, #96] // 16-byte Folded Spill
++; GNU-NEXT:    stp x24, x23, [sp, #112] // 16-byte Folded Spill
++; GNU-NEXT:    stp x22, x21, [sp, #128] // 16-byte Folded Spill
++; GNU-NEXT:    stp x20, x19, [sp, #144] // 16-byte Folded Spill
++; GNU-NEXT:    .cfi_def_cfa_offset 160
++; GNU-NEXT:    .cfi_offset w19, -8
++; GNU-NEXT:    .cfi_offset w20, -16
++; GNU-NEXT:    .cfi_offset w21, -24
++; GNU-NEXT:    .cfi_offset w22, -32
++; GNU-NEXT:    .cfi_offset w23, -40
++; GNU-NEXT:    .cfi_offset w24, -48
++; GNU-NEXT:    .cfi_offset w25, -56
++; GNU-NEXT:    .cfi_offset w26, -64
++; GNU-NEXT:    .cfi_offset w27, -72
++; GNU-NEXT:    .cfi_offset w28, -80
++; GNU-NEXT:    .cfi_offset w30, -96
++; GNU-NEXT:    .cfi_offset b8, -104
++; GNU-NEXT:    .cfi_offset b9, -112
++; GNU-NEXT:    .cfi_offset b10, -120
++; GNU-NEXT:    .cfi_offset b11, -128
++; GNU-NEXT:    .cfi_offset b12, -136
++; GNU-NEXT:    .cfi_offset b13, -144
++; GNU-NEXT:    .cfi_offset b14, -152
++; GNU-NEXT:    .cfi_offset b15, -160
++; GNU-NEXT:    bl preserve_none_give
++; GNU-NEXT:    ldp x20, x19, [sp, #144] // 16-byte Folded Reload
++; GNU-NEXT:    ldr w0, [x0]
++; GNU-NEXT:    ldp x22, x21, [sp, #128] // 16-byte Folded Reload
++; GNU-NEXT:    ldr x30, [sp, #64] // 8-byte Reload
++; GNU-NEXT:    ldp x24, x23, [sp, #112] // 16-byte Folded Reload
++; GNU-NEXT:    ldp x26, x25, [sp, #96] // 16-byte Folded Reload
++; GNU-NEXT:    ldp x28, x27, [sp, #80] // 16-byte Folded Reload
++; GNU-NEXT:    ldp d9, d8, [sp, #48] // 16-byte Folded Reload
++; GNU-NEXT:    ldp d11, d10, [sp, #32] // 16-byte Folded Reload
++; GNU-NEXT:    ldp d13, d12, [sp, #16] // 16-byte Folded Reload
++; GNU-NEXT:    ldp d15, d14, [sp], #160 // 16-byte Folded Reload
++; GNU-NEXT:    ret
++;
++; GNUBE-LABEL: deref_preserve_none_returned:
++; GNUBE:       // %bb.0:
++; GNUBE-NEXT:    stp d15, d14, [sp, #-160]! // 16-byte Folded Spill
++; GNUBE-NEXT:    stp d13, d12, [sp, #16] // 16-byte Folded Spill
++; GNUBE-NEXT:    stp d11, d10, [sp, #32] // 16-byte Folded Spill
++; GNUBE-NEXT:    stp d9, d8, [sp, #48] // 16-byte Folded Spill
++; GNUBE-NEXT:    str x30, [sp, #64] // 8-byte Spill
++; GNUBE-NEXT:    stp x28, x27, [sp, #80] // 16-byte Folded Spill
++; GNUBE-NEXT:    stp x26, x25, [sp, #96] // 16-byte Folded Spill
++; GNUBE-NEXT:    stp x24, x23, [sp, #112] // 16-byte Folded Spill
++; GNUBE-NEXT:    stp x22, x21, [sp, #128] // 16-byte Folded Spill
++; GNUBE-NEXT:    stp x20, x19, [sp, #144] // 16-byte Folded Spill
++; GNUBE-NEXT:    .cfi_def_cfa_offset 160
++; GNUBE-NEXT:    .cfi_offset w19, -8
++; GNUBE-NEXT:    .cfi_offset w20, -16
++; GNUBE-NEXT:    .cfi_offset w21, -24
++; GNUBE-NEXT:    .cfi_offset w22, -32
++; GNUBE-NEXT:    .cfi_offset w23, -40
++; GNUBE-NEXT:    .cfi_offset w24, -48
++; GNUBE-NEXT:    .cfi_offset w25, -56
++; GNUBE-NEXT:    .cfi_offset w26, -64
++; GNUBE-NEXT:    .cfi_offset w27, -72
++; GNUBE-NEXT:    .cfi_offset w28, -80
++; GNUBE-NEXT:    .cfi_offset w30, -96
++; GNUBE-NEXT:    .cfi_offset b8, -104
++; GNUBE-NEXT:    .cfi_offset b9, -112
++; GNUBE-NEXT:    .cfi_offset b10, -120
++; GNUBE-NEXT:    .cfi_offset b11, -128
++; GNUBE-NEXT:    .cfi_offset b12, -136
++; GNUBE-NEXT:    .cfi_offset b13, -144
++; GNUBE-NEXT:    .cfi_offset b14, -152
++; GNUBE-NEXT:    .cfi_offset b15, -160
++; GNUBE-NEXT:    bl preserve_none_give
++; GNUBE-NEXT:    ldp x20, x19, [sp, #144] // 16-byte Folded Reload
++; GNUBE-NEXT:    ldr w0, [x0]
++; GNUBE-NEXT:    ldp x22, x21, [sp, #128] // 16-byte Folded Reload
++; GNUBE-NEXT:    ldr x30, [sp, #64] // 8-byte Reload
++; GNUBE-NEXT:    ldp x24, x23, [sp, #112] // 16-byte Folded Reload
++; GNUBE-NEXT:    ldp x26, x25, [sp, #96] // 16-byte Folded Reload
++; GNUBE-NEXT:    ldp x28, x27, [sp, #80] // 16-byte Folded Reload
++; GNUBE-NEXT:    ldp d9, d8, [sp, #48] // 16-byte Folded Reload
++; GNUBE-NEXT:    ldp d11, d10, [sp, #32] // 16-byte Folded Reload
++; GNUBE-NEXT:    ldp d13, d12, [sp, #16] // 16-byte Folded Reload
++; GNUBE-NEXT:    ldp d15, d14, [sp], #160 // 16-byte Folded Reload
++; GNUBE-NEXT:    ret
++;
++; DARWIN-LABEL: deref_preserve_none_returned:
++; DARWIN:       ; %bb.0:
++; DARWIN-NEXT:    stp d15, d14, [sp, #-160]! ; 16-byte Folded Spill
++; DARWIN-NEXT:    stp d13, d12, [sp, #16] ; 16-byte Folded Spill
++; DARWIN-NEXT:    stp d11, d10, [sp, #32] ; 16-byte Folded Spill
++; DARWIN-NEXT:    stp d9, d8, [sp, #48] ; 16-byte Folded Spill
++; DARWIN-NEXT:    stp x28, x27, [sp, #64] ; 16-byte Folded Spill
++; DARWIN-NEXT:    stp x26, x25, [sp, #80] ; 16-byte Folded Spill
++; DARWIN-NEXT:    stp x24, x23, [sp, #96] ; 16-byte Folded Spill
++; DARWIN-NEXT:    stp x22, x21, [sp, #112] ; 16-byte Folded Spill
++; DARWIN-NEXT:    stp x20, x19, [sp, #128] ; 16-byte Folded Spill
++; DARWIN-NEXT:    stp x29, x30, [sp, #144] ; 16-byte Folded Spill
++; DARWIN-NEXT:    .cfi_def_cfa_offset 160
++; DARWIN-NEXT:    .cfi_offset w30, -8
++; DARWIN-NEXT:    .cfi_offset w29, -16
++; DARWIN-NEXT:    .cfi_offset w19, -24
++; DARWIN-NEXT:    .cfi_offset w20, -32
++; DARWIN-NEXT:    .cfi_offset w21, -40
++; DARWIN-NEXT:    .cfi_offset w22, -48
++; DARWIN-NEXT:    .cfi_offset w23, -56
++; DARWIN-NEXT:    .cfi_offset w24, -64
++; DARWIN-NEXT:    .cfi_offset w25, -72
++; DARWIN-NEXT:    .cfi_offset w26, -80
++; DARWIN-NEXT:    .cfi_offset w27, -88
++; DARWIN-NEXT:    .cfi_offset w28, -96
++; DARWIN-NEXT:    .cfi_offset b8, -104
++; DARWIN-NEXT:    .cfi_offset b9, -112
++; DARWIN-NEXT:    .cfi_offset b10, -120
++; DARWIN-NEXT:    .cfi_offset b11, -128
++; DARWIN-NEXT:    .cfi_offset b12, -136
++; DARWIN-NEXT:    .cfi_offset b13, -144
++; DARWIN-NEXT:    .cfi_offset b14, -152
++; DARWIN-NEXT:    .cfi_offset b15, -160
++; DARWIN-NEXT:    bl _preserve_none_give
++; DARWIN-NEXT:    ldp x29, x30, [sp, #144] ; 16-byte Folded Reload
++; DARWIN-NEXT:    ldr w0, [x0]
++; DARWIN-NEXT:    ldp x20, x19, [sp, #128] ; 16-byte Folded Reload
++; DARWIN-NEXT:    ldp x22, x21, [sp, #112] ; 16-byte Folded Reload
++; DARWIN-NEXT:    ldp x24, x23, [sp, #96] ; 16-byte Folded Reload
++; DARWIN-NEXT:    ldp x26, x25, [sp, #80] ; 16-byte Folded Reload
++; DARWIN-NEXT:    ldp x28, x27, [sp, #64] ; 16-byte Folded Reload
++; DARWIN-NEXT:    ldp d9, d8, [sp, #48] ; 16-byte Folded Reload
++; DARWIN-NEXT:    ldp d11, d10, [sp, #32] ; 16-byte Folded Reload
++; DARWIN-NEXT:    ldp d13, d12, [sp, #16] ; 16-byte Folded Reload
++; DARWIN-NEXT:    ldp d15, d14, [sp], #160 ; 16-byte Folded Reload
++; DARWIN-NEXT:    ret
++  %p = call preserve_nonecc ptr @preserve_none_give()
++  %v = load i32, ptr %p
++  ret i32 %v
++}
++
++; GCC supports the vector PCS, so its pointers are extended.
++define aarch64_vector_pcs i32 @vector_pcs_deref(ptr %p) {
++; GNU-LABEL: vector_pcs_deref:
++; GNU:       // %bb.0:
++; GNU-NEXT:    mov w8, w0
++; GNU-NEXT:    ldr w0, [x8]
++; GNU-NEXT:    ret
++;
++; GNUBE-LABEL: vector_pcs_deref:
++; GNUBE:       // %bb.0:
++; GNUBE-NEXT:    mov w8, w0
++; GNUBE-NEXT:    ldr w0, [x8]
++; GNUBE-NEXT:    ret
++;
++; DARWIN-LABEL: vector_pcs_deref:
++; DARWIN:       ; %bb.0:
++; DARWIN-NEXT:    ldr w0, [x0]
++; DARWIN-NEXT:    ret
++  %v = load i32, ptr %p
++  ret i32 %v
++}
+-- 
+2.43.0
+

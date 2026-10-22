@@ -1,0 +1,66 @@
+From ef06cd7578edb51e6846347a741dd784ebde0a04 Mon Sep 17 00:00:00 2001
+From: liviyifan <344781483+liviyifan@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 21:14:55 +0800
+Subject: [PATCH 07/10] [AArch64] Tune the Cortex-A35 like the Cortex-A53
+
+TuneA35 had no tuning features, so -mcpu=cortex-a35 got none of the
+macro-op fusions and scheduling options of -mcpu=cortex-a53. GCC tunes the
+Cortex-A35 as the Cortex-A53 apart from the issue rate (the cortexa35 tuning
+copies cortexa53's), and the two cores share their pipeline design. Give
+TuneA35 the A53 features: AES and ADRP+ADD fusion, balanced FP operations,
+the post-RA scheduler and WZR moves to vector registers. -mcpu=cortex-a35 now
+generates the same code as -mcpu=cortex-a53.
+
+Signed-off-by: liviyifan <344781483+liviyifan@users.noreply.github.com>
+---
+ llvm/lib/Target/AArch64/AArch64Processors.td        | 9 ++++++++-
+ llvm/test/CodeGen/AArch64/misched-fusion-addadrp.ll | 1 +
+ llvm/test/CodeGen/AArch64/misched-fusion-aes.ll     | 1 +
+ 3 files changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/llvm/lib/Target/AArch64/AArch64Processors.td b/llvm/lib/Target/AArch64/AArch64Processors.td
+index 6f38673c5..a27126121 100644
+--- a/llvm/lib/Target/AArch64/AArch64Processors.td
++++ b/llvm/lib/Target/AArch64/AArch64Processors.td
+@@ -14,8 +14,15 @@
+ //===----------------------------------------------------------------------===//
+ 
+ 
++// GCC tunes the Cortex-A35 as the Cortex-A53 (same fusions and pipeline model)
++// apart from the issue rate, which is part of the scheduling model here.
+ def TuneA35     : SubtargetFeature<"a35", "ARMProcFamily", "CortexA35",
+-                                "Cortex-A35 ARM processors">;
++                                   "Cortex-A35 ARM processors", [
++                                   FeatureFuseAES,
++                                   FeatureFuseAdrpAdd,
++                                   FeatureBalanceFPOps,
++                                   FeaturePostRAScheduler,
++                                   FeatureUseWzrToVecMove]>;
+ 
+ def TuneA320 : SubtargetFeature<"a320", "ARMProcFamily", "CortexA320",
+                                    "Cortex-A320 ARM processors", [
+diff --git a/llvm/test/CodeGen/AArch64/misched-fusion-addadrp.ll b/llvm/test/CodeGen/AArch64/misched-fusion-addadrp.ll
+index 70b6b91d3..33dffce66 100644
+--- a/llvm/test/CodeGen/AArch64/misched-fusion-addadrp.ll
++++ b/llvm/test/CodeGen/AArch64/misched-fusion-addadrp.ll
+@@ -1,5 +1,6 @@
+ ; RUN: llc %s -o - -mtriple=aarch64-unknown -mattr=+fuse-adrp-add | FileCheck %s
+ ; RUN: llc %s -o - -mtriple=aarch64-unknown -mcpu=generic         | FileCheck %s
++; RUN: llc %s -o - -mtriple=aarch64-unknown -mcpu=cortex-a35      | FileCheck %s
+ ; RUN: llc %s -o - -mtriple=aarch64-unknown -mcpu=cortex-a53      | FileCheck %s
+ ; RUN: llc %s -o - -mtriple=aarch64-unknown -mcpu=cortex-a55      | FileCheck %s
+ ; RUN: llc %s -o - -mtriple=aarch64-unknown -mcpu=cortex-a510     | FileCheck %s
+diff --git a/llvm/test/CodeGen/AArch64/misched-fusion-aes.ll b/llvm/test/CodeGen/AArch64/misched-fusion-aes.ll
+index dc6fa9128..6a5d0d841 100644
+--- a/llvm/test/CodeGen/AArch64/misched-fusion-aes.ll
++++ b/llvm/test/CodeGen/AArch64/misched-fusion-aes.ll
+@@ -1,5 +1,6 @@
+ ; RUN: llc %s -o - -mtriple=aarch64-unknown -mattr=+fuse-aes,+crypto | FileCheck %s
+ ; RUN: llc %s -o - -mtriple=aarch64-unknown -mcpu=generic -mattr=+crypto | FileCheck %s
++; RUN: llc %s -o - -mtriple=aarch64-unknown -mcpu=cortex-a35 | FileCheck %s
+ ; RUN: llc %s -o - -mtriple=aarch64-unknown -mcpu=cortex-a53 | FileCheck %s
+ ; RUN: llc %s -o - -mtriple=aarch64-unknown -mcpu=cortex-a57 | FileCheck %s
+ ; RUN: llc %s -o - -mtriple=aarch64-unknown -mcpu=cortex-a65 | FileCheck %s
+-- 
+2.43.0
+
