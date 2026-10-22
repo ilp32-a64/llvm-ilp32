@@ -1,18 +1,21 @@
 #!/bin/bash
 # Correctness tests for the clang AArch64 GNU ILP32 patches under QEMU (system
-# emulation with an ILP32 kernel, toolchain and runtime from test-ilp32,
-# https://github.com/ilp32-a64/test-ilp32, built beforehand):
+# emulation with an ILP32 kernel from test-ilp32, https://github.com/ilp32-a64/test-ilp32,
+# and its glibc ILP32 toolchain: GCC 14.3 + glibc 2.41, built beforehand by its
+# glibc/ scripts):
 #   llvm-abi-O0/-O2  GCC <-> clang pointer passing (abi_gcc.c, abi_clang.c, abi_old.S)
 #   sqlite-cmp       GCC-built vs clang-built sqlite3 shell on workload.sql
-# Usage: run.sh [kernel name]   (default ilp32-6.6-a32, i.e. test-ilp32/qemu/out/Image-<name>)
+# Usage: run.sh [kernel name]   (default ilp32-6.12.y-a32, i.e. test-ilp32/qemu/out/Image-<name>;
+#        glibc 2.41 needs a kernel with the ILP32 time64 system calls)
 # Environment: ILP32_TEST (test-ilp32 checkout, default ~/work/test-ilp32),
+#              ILP32_TOOLCHAIN (default ~/work/ilp32-glibc/toolchain/out),
 #              CLANG (default: the clang built by ../../build.sh)
 set -euo pipefail
 cd "$(dirname "$0")"
 D=$PWD
-K=${1:-ilp32-6.6-a32}
+K=${1:-ilp32-6.12.y-a32}
 IT=${ILP32_TEST:-$HOME/work/test-ilp32}
-TC=$IT/toolchain/out
+TC=${ILP32_TOOLCHAIN:-$HOME/work/ilp32-glibc/toolchain/out}
 T=aarch64-linux-gnu_ilp32
 SYSROOT=$TC/$T/sysroot
 GCC=$TC/bin/$T-gcc
@@ -45,11 +48,10 @@ W=$(mktemp -d)
 trap 'rm -rf "$W"' EXIT
 mkdir -p "$W"/{libilp32,lib,tests,bin,data,dev,proc,tmp}
 "$GCC" -static -O2 -Wall -o "$W/init" "$IT/qemu/init.c"
-for d in "$SYSROOT/libilp32" "$SYSROOT/usr/libilp32" "$TC/$T/libilp32"; do
-	find "$d" -maxdepth 1 \( -name '*.so.*' -o -name 'ld-*.so' -o -name 'lib*-2.30.so' \) \
-		\( -type f -o -type l \) ! -name '*.py' -exec cp -a {} "$W/libilp32/" \;
+for d in "$SYSROOT/libilp32" "$TC/$T/libilp32"; do
+	find "$d" -maxdepth 1 -name '*.so.[0-9]' ! -name '*.py' -exec cp -L {} "$W/libilp32/" \;
 done
-ln -s ../libilp32/ld-2.30.so "$W/lib/ld-linux-aarch64_ilp32.so.1"
+cp -L "$SYSROOT/lib/ld-linux-aarch64_ilp32.so.1" "$W/lib/"
 cp "$O/llvm-abi-O0" "$O/llvm-abi-O2" "$O/sqlite-cmp" "$W/tests/"
 cp "$O/sqlite3-gcc" "$O/sqlite3-clang" "$W/bin/"
 cp workload.sql "$W/data/"

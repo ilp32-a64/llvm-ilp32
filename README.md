@@ -107,7 +107,8 @@ measured on hardware yet.
 - Predefined type macros compared with GCC 14 `-mabi=ilp32`; GCC 10.5, 13 and
   14 checked for their pointer passing (unchanged across versions).
 - `tests/qemu/run.sh` runs programs under QEMU system emulation with an ILP32
-  kernel (from [test-ilp32](https://github.com/ilp32-a64/test-ilp32)):
+  kernel and the glibc ILP32 toolchain (GCC 14.3, glibc 2.41) from
+  [test-ilp32](https://github.com/ilp32-a64/test-ilp32):
   - `llvm-abi-O0`, `llvm-abi-O2`: GCC-compiled code passes clang-compiled code
     pointers with garbage in the upper 32 bits (in a register, as a ninth
     argument on the stack, as a return value), and glibc `qsort` calls a clang
@@ -116,7 +117,7 @@ measured on hardware yet.
   - `sqlite-cmp`: the sqlite3 shell built by clang alone (compile and link) and
     the one built by GCC must print identical output for `workload.sql`.
 
-  All pass with the ilp32-6.6 kernel (2026-10-22).
+  All pass with the ilp32-6.12.y kernel and glibc 2.41 (2026-10-23).
 - `tests/qemu/run-musl.sh` runs the same tests with musl: the GCC side and the
   runtime come from an OpenWrt aarch64 ILP32 musl toolchain, clang uses
   `--target=aarch64-openwrt-linux-musl_ilp32`. All pass (2026-10-22).
