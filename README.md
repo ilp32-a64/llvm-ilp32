@@ -128,6 +128,28 @@ measured on hardware yet.
   come from the minimal test system.
 - Not yet run on hardware.
 
+## Upstreaming and maintenance: help wanted
+
+The author does not plan to submit these patches to LLVM. Anyone is welcome to
+take them upstream, whole or in part, under their own name, without asking
+first. Please keep the original `Signed-off-by` line (or credit the author in
+the commit message) next to your own, and feel free to rework the patches as
+reviewers ask.
+
+Likewise, anyone who wants to maintain the GNU ILP32 support in LLVM, or an
+AArch64 ILP32 target in other compilers built on LLVM such as Rust's
+`aarch64-unknown-linux-gnu_ilp32` (and a future `musl_ilp32`), is welcome to
+take that role.
+
+Notes for a submission:
+
+- `0007` (Cortex-A35 tuning) does not depend on ILP32 and can go on its own.
+- `0001` and `0003` continue review D104931.
+- The AArch64 ILP32 kernel and C library ports these patches are used with are
+  not upstream either; reviewers are likely to ask about that.
+
+Issues and pull requests in this repository are welcome too.
+
 ## License
 
 The patches are contributions to LLVM and are under the same license, Apache
