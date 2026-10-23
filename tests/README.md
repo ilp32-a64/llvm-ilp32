@@ -54,3 +54,16 @@ kernel (2026-10-23).
   clang-built CPython (default ThinLTO import limit) passes `test_json`,
   `test_re`, `test_math`, `test_float` and `test_struct`, and the PGO training
   run (`-m test --pgo`, 43 test files).
+
+## Pointer authentication
+
+- C++ exceptions through `pac-ret` frames (clang `-O2 -mbranch-protection=pac-ret`,
+  dynamically linked PIE, 100 exceptions): with the libgcc ILP32 unwinder fix
+  ([test-ilp32](https://github.com/ilp32-a64/test-ilp32) `glibc/toolchain/patches/`,
+  OpenWrt patch 990) all pass, without it the program crashes with SIGSEGV.
+  Checked on a Cortex-A35 board (without pointer authentication) and in QEMU
+  (`-cpu max` and cortex-a35).
+- Patch 0011: with `-mbranch-protection=standard`, GNU ld accepts the ELF32
+  `.note.gnu.property` and keeps the BTI/PAC markings in the output when all
+  input objects have them (before 0011 it reported "corrupt GNU_PROPERTY_TYPE"
+  and dropped them).
