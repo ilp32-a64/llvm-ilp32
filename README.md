@@ -53,12 +53,12 @@ clang --target=aarch64-openwrt-linux-musl_ilp32 --gcc-toolchain=$O --sysroot=$O 
 | Build | Speed | Memory |
 |---|---:|---:|
 | LP64, GCC 14 | 1.00 | 17.0 MB |
-| ILP32, GCC 14 | 1.02 | 11.4 MB (-33%) |
+| ILP32, GCC 14 | 1.01 | 11.7 MB (-31%) |
 | ILP32, clang (PGO + ThinLTO + tail calls) | 1.09 | 13.0 MB (-23%) |
 | ILP32, clang, with `-import-instr-limit=30` | 1.09 | 12.7 MB (-25%) |
 | armhf, GCC 14 | 1.00 | 10.6 MB (-38%) |
 
-All builds use PGO and LTO; geometric mean of 9 benchmarks. Method, SQLite,
+All builds are PIE and use PGO and LTO; geometric mean of 9 benchmarks. Method, SQLite,
 per-benchmark results and a code size analysis:
 [docs/benchmarks.md](docs/benchmarks.md).
 

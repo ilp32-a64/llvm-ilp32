@@ -12,30 +12,36 @@ mean of the medians (2026-10-23).
 | CPython 3.14.9 | Speed vs LP64 | Max RSS | SQLite speedtest1 vs LP64 |
 |---|---:|---:|---:|
 | LP64, GCC 14.2, PGO + LTO | 1.000 | 17.0 MB | 1.000 (15.52 s) |
-| ILP32, GCC 14.3, PGO + LTO | 1.018 | 11.4 MB (-33%) | 1.013 |
+| ILP32, GCC 14.3, PGO + LTO | 1.009³ | 11.7 MB (-31%)³ | –³ |
 | ILP32, clang 22 + these patches, PGO + ThinLTO + tail-calling interpreter (default import limit 100) | 1.089 | 13.0 MB (-23%) | 0.958 |
 | ILP32, the same, linked with `-Wl,-plugin-opt=-import-instr-limit=30` | 1.09¹ | 12.7 MB (-25%) | 0.958² |
 | armhf (Thumb-2), GCC 14.2, PGO + LTO | 1.004 | 10.6 MB (-38%) | 0.859 |
 
-¹ Measured against the ILP32 GCC build in a separate run (1.075 × 1.018);
-within noise of the default limit.
+¹ Derived from a separate run: the ratio to the same non-PIE ILP32 GCC binary,
+present in both runs, chained to the LP64 baseline (1.075 × 1.018). Both clang
+and LP64 are PIE; within noise of the default limit.
 
 ² SQLite is a separate `-O2` build without PGO or LTO, so the import limit
-does not apply; there clang is 5% slower than GCC.
+does not apply; there clang is 4% slower than LP64 GCC.
+
+³ PIE build, measured with its own LP64 baseline in a separate run
+(2026-10-23). Its SQLite speedtest1 was not measured as PIE (the GCC ILP32
+speedtest1 used here is not PIE).
 
 - ILP32 keeps the AArch64 speed and comes close to armhf in memory; armhf is
   14% slower on SQLite. `/proc/self/smaps` shows where the memory goes: the
   heap is 67% and other anonymous memory 49% smaller than with LP64.
-- The clang build uses 1.6 MB more than the GCC ILP32 build (1.3 MB with
-  limit 30), almost all of it code: its `.text` is 4.05 MB (3.82 MB) against
+- The clang build uses 1.3 MB more than the GCC ILP32 build (1.0 MB with
+  limit 30), all of it code: its `.text` is 4.05 MB (3.82 MB) against
   2.88 MB. The cause is ThinLTO's cross-module importing: without LTO, clang's
   code is 7% smaller than GCC's, and ThinLTO adds 23%. Limit 30 saves about
   0.3 MB of resident code at no speed cost; a limit of 10 saves a little more
   but is 4% slower.
-- The GCC ILP32 toolchain used here does not default to PIE; the others do.
-  PIE costs about 130 KB (RELRO) in this test.
-- Per benchmark, with either import limit, clang is best on regex (+15% vs GCC
-  ILP32) and worst on json (-6%).
+- All builds are PIE. For GCC ILP32, PIE costs about 0.3 MB of max RSS
+  (130 KB of it RELRO) and no measurable speed.
+- Per benchmark, against the GCC ILP32 build (both PIE, default import
+  limit, same run), clang is best on function calls (+19%) and worst on json
+  (-4%).
 
 ## Static code size
 
