@@ -75,6 +75,7 @@ per-benchmark results and a code size analysis:
 | `0008` | Pointer arguments at `-O0` |
 | `0009`–`0010` | Smaller ILP32 code |
 | `0011` | BTI/PAC markings for ILP32 (ELF32 layout) |
+| `0012` | Keep 32x32→64 multiplies (`smull`/`smaddl`) when promoting extensions; not ILP32-specific |
 
 Each patch's commit message has the details.
 

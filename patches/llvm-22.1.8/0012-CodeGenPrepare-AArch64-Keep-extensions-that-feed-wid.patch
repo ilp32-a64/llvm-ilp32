@@ -1,0 +1,459 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: liviyifan <344781483+liviyifan@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 20:54:43 +0800
+Subject: [PATCH] [CodeGenPrepare][AArch64] Keep extensions that feed widening
+ multiplies
+
+Extension promotion moves a sext/zext above an nsw/nuw operation so that it
+can be merged into a load (ldrsw). When the extension is an operand of a
+multiply whose other operand is an extension of the same kind and width (or
+a small constant), this turns a widening multiply into a full-width one: on
+AArch64 SMULL/SMADDL become 64-bit MUL/MADD, which cost more than the sxtw
+the merge saves, especially when the promoted value is shared by several
+products.
+
+This happens in 32-bit limb arithmetic such as the ref10 field code of
+curve25519 (g9_19 = 19 * g9, f1_2 = 2 * f1, then (int64_t)f1_2 * g9_19):
+clang emitted 57 of the 101 products of fe_mul and 53 of fe_sq as 64-bit
+multiplies, GCC none. It is not ILP32 specific; LP64 is affected the same
+way. On a Cortex-A35, OpenSSL's X25519 and Ed25519 verify were 11-14%
+slower than with GCC because of this.
+
+Add TargetLowering::preferWideningMulOverExtPromotion() (false by default,
+true for AArch64) and leave such extensions in place.
+-cgp-keep-widening-mul-ext=false restores the old behaviour. In OpenSSL 3.5
+only three objects change (curve25519.o and two others, all smaller); the
+SQLite amalgamation is unchanged.
+
+Signed-off-by: liviyifan <344781483+liviyifan@users.noreply.github.com>
+---
+ llvm/include/llvm/CodeGen/TargetLowering.h    |   9 +
+ llvm/lib/CodeGen/CodeGenPrepare.cpp           |  39 ++++
+ llvm/lib/Target/AArch64/AArch64ISelLowering.h |   4 +
+ .../AArch64/smull-cgp-ext-promotion.ll        |  92 ++++++++
+ .../AArch64/ext-promotion-widening-mul.ll     | 218 ++++++++++++++++++
+ 5 files changed, 362 insertions(+)
+ create mode 100644 llvm/test/CodeGen/AArch64/smull-cgp-ext-promotion.ll
+ create mode 100644 llvm/test/Transforms/CodeGenPrepare/AArch64/ext-promotion-widening-mul.ll
+
+diff --git a/llvm/include/llvm/CodeGen/TargetLowering.h b/llvm/include/llvm/CodeGen/TargetLowering.h
+index 1df4ba582..a7c98faf5 100644
+--- a/llvm/include/llvm/CodeGen/TargetLowering.h
++++ b/llvm/include/llvm/CodeGen/TargetLowering.h
+@@ -973,6 +973,15 @@ public:
+   /// promotedInst1(...(promotedInstN(ext(load)))).
+   bool enableExtLdPromotion() const { return EnableExtLdPromotion; }
+ 
++  /// Return true if extension promotion in CodeGenPrepare should keep an
++  /// extension that is an operand of a widening multiply, i.e. of a multiply
++  /// whose other operand is an extension of the same kind from a type no
++  /// wider than the source type of this one, or a constant that fits in that
++  /// type. On targets that select mul(ext(a), ext(b)) as one widening
++  /// multiply, moving the extension above the operation that defines a would
++  /// turn it into a full-width multiply.
++  virtual bool preferWideningMulOverExtPromotion() const { return false; }
++
+   /// Return true if the target can combine store(extractelement VectorTy,
+   /// Idx).
+   /// \p Cost[out] gives the cost of that transformation when this is true.
+diff --git a/llvm/lib/CodeGen/CodeGenPrepare.cpp b/llvm/lib/CodeGen/CodeGenPrepare.cpp
+index 6161f7818..2db4bc801 100644
+--- a/llvm/lib/CodeGen/CodeGenPrepare.cpp
++++ b/llvm/lib/CodeGen/CodeGenPrepare.cpp
+@@ -163,6 +163,11 @@ static cl::opt<bool> StressStoreExtract(
+     "stress-cgp-store-extract", cl::Hidden, cl::init(false),
+     cl::desc("Stress test store(extract) optimizations in CodeGenPrepare"));
+ 
++static cl::opt<bool> KeepWideningMulExt(
++    "cgp-keep-widening-mul-ext", cl::Hidden, cl::init(true),
++    cl::desc("Do not promote an extension that is an operand of a widening "
++             "multiply, on targets that prefer widening multiplies"));
++
+ static cl::opt<bool> DisableExtLdPromotion(
+     "disable-cgp-ext-ld-promotion", cl::Hidden, cl::init(false),
+     cl::desc("Disable ext(promotable(ld)) -> promoted(ext(ld)) optimization in "
+@@ -6598,6 +6603,30 @@ bool CodeGenPrepare::optimizeInlineAsmInst(CallInst *CS) {
+   return MadeChange;
+ }
+ 
++/// Check if the extension \p Ext is an operand of a widening multiply: a
++/// multiply whose other operand is an extension of the same kind from a type
++/// no wider than the source type of \p Ext, or a constant that fits in it.
++static bool isWideningMulOperand(const Instruction *Ext) {
++  bool IsSExt = isa<SExtInst>(Ext);
++  unsigned SrcBits = Ext->getOperand(0)->getType()->getScalarSizeInBits();
++  for (const User *U : Ext->users()) {
++    const auto *Mul = dyn_cast<BinaryOperator>(U);
++    if (!Mul || Mul->getOpcode() != Instruction::Mul)
++      continue;
++    const Value *Other =
++        Mul->getOperand(0) == Ext ? Mul->getOperand(1) : Mul->getOperand(0);
++    if (const auto *OtherExt = dyn_cast<CastInst>(Other))
++      if ((IsSExt ? isa<SExtInst>(OtherExt) : isa<ZExtInst>(OtherExt)) &&
++          OtherExt->getSrcTy()->getScalarSizeInBits() <= SrcBits)
++        return true;
++    if (const auto *C = dyn_cast<ConstantInt>(Other))
++      if (IsSExt ? C->getValue().isSignedIntN(SrcBits)
++                 : C->getValue().isIntN(SrcBits))
++        return true;
++  }
++  return false;
++}
++
+ /// Check if all the uses of \p Val are equivalent (or free) zero or
+ /// sign extensions.
+ static bool hasSameExtUse(Value *Val, const TargetLowering &TLI) {
+@@ -6674,6 +6703,16 @@ bool CodeGenPrepare::tryToPromoteExts(
+     if (!TLI->enableExtLdPromotion() || DisableExtLdPromotion)
+       return false;
+ 
++    // Keep an extension that feeds a widening multiply where it is: moving
++    // it above its (nsw/nuw) operand would make the multiply full width
++    // (e.g. on AArch64 a 64-bit MADD instead of SMADDL), which costs more
++    // than the extension that merging into a load could save.
++    if (KeepWideningMulExt && TLI->preferWideningMulOverExtPromotion() &&
++        isWideningMulOperand(I)) {
++      ProfitablyMovedExts.push_back(I);
++      continue;
++    }
++
+     // Get the action to perform the promotion.
+     TypePromotionHelper::Action TPH =
+         TypePromotionHelper::getAction(I, InsertedInsts, *TLI, PromotedInsts);
+diff --git a/llvm/lib/Target/AArch64/AArch64ISelLowering.h b/llvm/lib/Target/AArch64/AArch64ISelLowering.h
+index 258651261..acc532386 100644
+--- a/llvm/lib/Target/AArch64/AArch64ISelLowering.h
++++ b/llvm/lib/Target/AArch64/AArch64ISelLowering.h
+@@ -221,6 +221,10 @@ public:
+   bool isProfitableToHoist(Instruction *I) const override;
+ 
+   bool isZExtFree(Type *Ty1, Type *Ty2) const override;
++
++  /// mul(sext/zext i32, sext/zext i32) is SMULL/UMULL (SMADDL/UMADDL with an
++  /// add), cheaper than a 64-bit MUL/MADD on many cores.
++  bool preferWideningMulOverExtPromotion() const override { return true; }
+   bool isZExtFree(EVT VT1, EVT VT2) const override;
+   bool isZExtFree(SDValue Val, EVT VT2) const override;
+ 
+diff --git a/llvm/test/CodeGen/AArch64/smull-cgp-ext-promotion.ll b/llvm/test/CodeGen/AArch64/smull-cgp-ext-promotion.ll
+new file mode 100644
+index 000000000..3dba82856
+--- /dev/null
++++ b/llvm/test/CodeGen/AArch64/smull-cgp-ext-promotion.ll
+@@ -0,0 +1,92 @@
++; NOTE: Assertions have been autogenerated by utils/update_llc_test_checks.py UTC_ARGS: --version 6
++; RUN: llc -mtriple=aarch64-linux-gnu -O2 < %s | FileCheck %s --check-prefix=LP64
++; RUN: llc -mtriple=aarch64-linux-gnu_ilp32 -O2 < %s | FileCheck %s --check-prefix=ILP32
++
++; 32x32->64 products whose 32-bit factors are shared (curve25519 ref10 fe_mul:
++; g9_19 = 19 * g9, f1_2 = 2 * f1) must stay SMULL/SMADDL: CodeGenPrepare must
++; not promote the sign extensions above the nsw mul/shl to merge them into the
++; loads, which made them 64-bit MUL/MADD.
++
++define void @ref10(ptr %o, ptr %f, ptr %g) {
++; LP64-LABEL: ref10:
++; LP64:       // %bb.0: // %entry
++; LP64-NEXT:    ldr w8, [x2, #36]
++; LP64-NEXT:    mov w9, #19 // =0x13
++; LP64-NEXT:    ldr w10, [x1, #4]
++; LP64-NEXT:    ldr w11, [x1, #12]
++; LP64-NEXT:    mul w8, w8, w9
++; LP64-NEXT:    lsl w9, w10, #1
++; LP64-NEXT:    lsl w11, w11, #1
++; LP64-NEXT:    smull x10, w9, w8
++; LP64-NEXT:    str x10, [x0]
++; LP64-NEXT:    ldrsw x10, [x1, #8]
++; LP64-NEXT:    smull x10, w10, w8
++; LP64-NEXT:    smull x8, w11, w8
++; LP64-NEXT:    stp x10, x8, [x0, #8]
++; LP64-NEXT:    ldrsw x8, [x2]
++; LP64-NEXT:    ldrsw x10, [x2, #8]
++; LP64-NEXT:    smull x8, w8, w9
++; LP64-NEXT:    smaddl x8, w10, w11, x8
++; LP64-NEXT:    str x8, [x0, #32]
++; LP64-NEXT:    ret
++;
++; ILP32-LABEL: ref10:
++; ILP32:       // %bb.0: // %entry
++; ILP32-NEXT:    mov w8, w2
++; ILP32-NEXT:    mov w9, w1
++; ILP32-NEXT:    mov w11, #19 // =0x13
++; ILP32-NEXT:    ldr w10, [x8, #36]
++; ILP32-NEXT:    ldr w12, [x9, #4]
++; ILP32-NEXT:    mov w13, w0
++; ILP32-NEXT:    ldr w14, [x9, #12]
++; ILP32-NEXT:    mul w10, w10, w11
++; ILP32-NEXT:    lsl w11, w12, #1
++; ILP32-NEXT:    smull x12, w11, w10
++; ILP32-NEXT:    str x12, [x13]
++; ILP32-NEXT:    lsl w12, w14, #1
++; ILP32-NEXT:    ldrsw x9, [x9, #8]
++; ILP32-NEXT:    smull x9, w9, w10
++; ILP32-NEXT:    smull x10, w12, w10
++; ILP32-NEXT:    stp x9, x10, [x13, #8]
++; ILP32-NEXT:    ldrsw x9, [x8]
++; ILP32-NEXT:    ldrsw x8, [x8, #8]
++; ILP32-NEXT:    smull x9, w9, w11
++; ILP32-NEXT:    smaddl x8, w8, w12, x9
++; ILP32-NEXT:    str x8, [x13, #32]
++; ILP32-NEXT:    ret
++entry:
++  %g.9 = getelementptr inbounds i8, ptr %g, i64 36
++  %g9 = load i32, ptr %g.9, align 4
++  %g9_19 = mul nsw i32 %g9, 19
++  %f.1 = getelementptr inbounds i8, ptr %f, i64 4
++  %f1 = load i32, ptr %f.1, align 4
++  %f1_2 = shl nsw i32 %f1, 1
++  %f.3 = getelementptr inbounds i8, ptr %f, i64 12
++  %f3 = load i32, ptr %f.3, align 4
++  %f3_2 = shl nsw i32 %f3, 1
++  %f1_2.ext = sext i32 %f1_2 to i64
++  %g9_19.ext = sext i32 %g9_19 to i64
++  %p0 = mul nsw i64 %f1_2.ext, %g9_19.ext
++  store i64 %p0, ptr %o, align 8
++  %f.2 = getelementptr inbounds i8, ptr %f, i64 8
++  %f2 = load i32, ptr %f.2, align 4
++  %f2.ext = sext i32 %f2 to i64
++  %p1 = mul nsw i64 %f2.ext, %g9_19.ext
++  %o.1 = getelementptr inbounds i8, ptr %o, i64 8
++  store i64 %p1, ptr %o.1, align 8
++  %f3_2.ext = sext i32 %f3_2 to i64
++  %p2 = mul nsw i64 %f3_2.ext, %g9_19.ext
++  %o.2 = getelementptr inbounds i8, ptr %o, i64 16
++  store i64 %p2, ptr %o.2, align 8
++  %g0 = load i32, ptr %g, align 4
++  %g0.ext = sext i32 %g0 to i64
++  %q0 = mul nsw i64 %g0.ext, %f1_2.ext
++  %g.2 = getelementptr inbounds i8, ptr %g, i64 8
++  %g2 = load i32, ptr %g.2, align 4
++  %g2.ext = sext i32 %g2 to i64
++  %q1 = mul nsw i64 %g2.ext, %f3_2.ext
++  %q = add nsw i64 %q1, %q0
++  %o.4 = getelementptr inbounds i8, ptr %o, i64 32
++  store i64 %q, ptr %o.4, align 8
++  ret void
++}
+diff --git a/llvm/test/Transforms/CodeGenPrepare/AArch64/ext-promotion-widening-mul.ll b/llvm/test/Transforms/CodeGenPrepare/AArch64/ext-promotion-widening-mul.ll
+new file mode 100644
+index 000000000..7eee50f8e
+--- /dev/null
++++ b/llvm/test/Transforms/CodeGenPrepare/AArch64/ext-promotion-widening-mul.ll
+@@ -0,0 +1,218 @@
++; NOTE: Assertions have been autogenerated by utils/update_test_checks.py UTC_ARGS: --version 6
++; RUN: opt -passes='require<profile-summary>,function(codegenprepare)' -mtriple=aarch64-linux-gnu -S < %s | FileCheck %s
++; RUN: opt -passes='require<profile-summary>,function(codegenprepare)' -mtriple=aarch64-linux-gnu_ilp32 -S < %s | FileCheck %s
++; RUN: opt -passes='require<profile-summary>,function(codegenprepare)' -mtriple=aarch64-linux-gnu -cgp-keep-widening-mul-ext=false -S < %s | FileCheck %s --check-prefix=OFF
++
++; An extension that is an operand of a widening multiply (the other operand is
++; an extension from the same width, or a constant that fits) stays where it is:
++; moving it above the nsw/nuw operation to merge it into the load would turn
++; SMULL/UMULL (SMADDL/UMADDL) into a 64-bit MUL/MADD. This is the 32-bit field
++; arithmetic of curve25519 (ref10): f1_2 = 2 * f1, g9_19 = 19 * g9, then
++; (int64_t)f1_2 * g9_19 and friends.
++
++; The 19 * g factor, shared by several products.
++define void @mul_const_shared(ptr %o, ptr %f, ptr %g) {
++; CHECK-LABEL: define void @mul_const_shared(
++; CHECK-SAME: ptr [[O:%.*]], ptr [[F:%.*]], ptr [[G:%.*]]) {
++; CHECK-NEXT:  [[ENTRY:.*:]]
++; CHECK-NEXT:    [[G9:%.*]] = load i32, ptr [[G]], align 4
++; CHECK-NEXT:    [[G9_19:%.*]] = mul nsw i32 [[G9]], 19
++; CHECK-NEXT:    [[G9_19_EXT:%.*]] = sext i32 [[G9_19]] to i64
++; CHECK-NEXT:    [[F1:%.*]] = load i32, ptr [[F]], align 4
++; CHECK-NEXT:    [[F1_EXT:%.*]] = sext i32 [[F1]] to i64
++; CHECK-NEXT:    [[P0:%.*]] = mul nsw i64 [[F1_EXT]], [[G9_19_EXT]]
++; CHECK-NEXT:    store i64 [[P0]], ptr [[O]], align 8
++; CHECK-NEXT:    [[F_2:%.*]] = getelementptr inbounds i8, ptr [[F]], i64 4
++; CHECK-NEXT:    [[F2:%.*]] = load i32, ptr [[F_2]], align 4
++; CHECK-NEXT:    [[F2_EXT:%.*]] = sext i32 [[F2]] to i64
++; CHECK-NEXT:    [[P1:%.*]] = mul nsw i64 [[F2_EXT]], [[G9_19_EXT]]
++; CHECK-NEXT:    [[O_1:%.*]] = getelementptr inbounds i8, ptr [[O]], i64 8
++; CHECK-NEXT:    store i64 [[P1]], ptr [[O_1]], align 8
++; CHECK-NEXT:    ret void
++;
++; OFF-LABEL: define void @mul_const_shared(
++; OFF-SAME: ptr [[O:%.*]], ptr [[F:%.*]], ptr [[G:%.*]]) {
++; OFF-NEXT:  [[ENTRY:.*:]]
++; OFF-NEXT:    [[G9:%.*]] = load i32, ptr [[G]], align 4
++; OFF-NEXT:    [[PROMOTED:%.*]] = sext i32 [[G9]] to i64
++; OFF-NEXT:    [[G9_19:%.*]] = mul nsw i64 [[PROMOTED]], 19
++; OFF-NEXT:    [[F1:%.*]] = load i32, ptr [[F]], align 4
++; OFF-NEXT:    [[F1_EXT:%.*]] = sext i32 [[F1]] to i64
++; OFF-NEXT:    [[P0:%.*]] = mul nsw i64 [[F1_EXT]], [[G9_19]]
++; OFF-NEXT:    store i64 [[P0]], ptr [[O]], align 8
++; OFF-NEXT:    [[F_2:%.*]] = getelementptr inbounds i8, ptr [[F]], i64 4
++; OFF-NEXT:    [[F2:%.*]] = load i32, ptr [[F_2]], align 4
++; OFF-NEXT:    [[F2_EXT:%.*]] = sext i32 [[F2]] to i64
++; OFF-NEXT:    [[P1:%.*]] = mul nsw i64 [[F2_EXT]], [[G9_19]]
++; OFF-NEXT:    [[O_1:%.*]] = getelementptr inbounds i8, ptr [[O]], i64 8
++; OFF-NEXT:    store i64 [[P1]], ptr [[O_1]], align 8
++; OFF-NEXT:    ret void
++;
++entry:
++  %g9 = load i32, ptr %g, align 4
++  %g9_19 = mul nsw i32 %g9, 19
++  %g9_19.ext = sext i32 %g9_19 to i64
++  %f1 = load i32, ptr %f, align 4
++  %f1.ext = sext i32 %f1 to i64
++  %p0 = mul nsw i64 %f1.ext, %g9_19.ext
++  store i64 %p0, ptr %o, align 8
++  %f.2 = getelementptr inbounds i8, ptr %f, i64 4
++  %f2 = load i32, ptr %f.2, align 4
++  %f2.ext = sext i32 %f2 to i64
++  %p1 = mul nsw i64 %f2.ext, %g9_19.ext
++  %o.1 = getelementptr inbounds i8, ptr %o, i64 8
++  store i64 %p1, ptr %o.1, align 8
++  ret void
++}
++
++; The doubled 2 * f factor (shl nsw), times a sign-extended value.
++define i64 @shl_times_sext(ptr %f, ptr %g) {
++; CHECK-LABEL: define i64 @shl_times_sext(
++; CHECK-SAME: ptr [[F:%.*]], ptr [[G:%.*]]) {
++; CHECK-NEXT:  [[ENTRY:.*:]]
++; CHECK-NEXT:    [[F1:%.*]] = load i32, ptr [[F]], align 4
++; CHECK-NEXT:    [[F1_2:%.*]] = shl nsw i32 [[F1]], 1
++; CHECK-NEXT:    [[F1_2_EXT:%.*]] = sext i32 [[F1_2]] to i64
++; CHECK-NEXT:    [[G0:%.*]] = load i32, ptr [[G]], align 4
++; CHECK-NEXT:    [[G0_EXT:%.*]] = sext i32 [[G0]] to i64
++; CHECK-NEXT:    [[P:%.*]] = mul nsw i64 [[F1_2_EXT]], [[G0_EXT]]
++; CHECK-NEXT:    ret i64 [[P]]
++;
++; OFF-LABEL: define i64 @shl_times_sext(
++; OFF-SAME: ptr [[F:%.*]], ptr [[G:%.*]]) {
++; OFF-NEXT:  [[ENTRY:.*:]]
++; OFF-NEXT:    [[F1:%.*]] = load i32, ptr [[F]], align 4
++; OFF-NEXT:    [[PROMOTED:%.*]] = sext i32 [[F1]] to i64
++; OFF-NEXT:    [[F1_2:%.*]] = shl nsw i64 [[PROMOTED]], 1
++; OFF-NEXT:    [[G0:%.*]] = load i32, ptr [[G]], align 4
++; OFF-NEXT:    [[G0_EXT:%.*]] = sext i32 [[G0]] to i64
++; OFF-NEXT:    [[P:%.*]] = mul nsw i64 [[F1_2]], [[G0_EXT]]
++; OFF-NEXT:    ret i64 [[P]]
++;
++entry:
++  %f1 = load i32, ptr %f, align 4
++  %f1_2 = shl nsw i32 %f1, 1
++  %f1_2.ext = sext i32 %f1_2 to i64
++  %g0 = load i32, ptr %g, align 4
++  %g0.ext = sext i32 %g0 to i64
++  %p = mul nsw i64 %f1_2.ext, %g0.ext
++  ret i64 %p
++}
++
++; Unsigned: zext of an nuw add times a zext.
++define i64 @zext_umull(ptr %a, ptr %b) {
++; CHECK-LABEL: define i64 @zext_umull(
++; CHECK-SAME: ptr [[A:%.*]], ptr [[B:%.*]]) {
++; CHECK-NEXT:  [[ENTRY:.*:]]
++; CHECK-NEXT:    [[X:%.*]] = load i32, ptr [[A]], align 4
++; CHECK-NEXT:    [[X1:%.*]] = add nuw i32 [[X]], 1
++; CHECK-NEXT:    [[X1_EXT:%.*]] = zext i32 [[X1]] to i64
++; CHECK-NEXT:    [[Y:%.*]] = load i32, ptr [[B]], align 4
++; CHECK-NEXT:    [[Y_EXT:%.*]] = zext i32 [[Y]] to i64
++; CHECK-NEXT:    [[P:%.*]] = mul nuw i64 [[X1_EXT]], [[Y_EXT]]
++; CHECK-NEXT:    ret i64 [[P]]
++;
++; OFF-LABEL: define i64 @zext_umull(
++; OFF-SAME: ptr [[A:%.*]], ptr [[B:%.*]]) {
++; OFF-NEXT:  [[ENTRY:.*:]]
++; OFF-NEXT:    [[X:%.*]] = load i32, ptr [[A]], align 4
++; OFF-NEXT:    [[PROMOTED:%.*]] = zext i32 [[X]] to i64
++; OFF-NEXT:    [[X1:%.*]] = add nuw i64 [[PROMOTED]], 1
++; OFF-NEXT:    [[Y:%.*]] = load i32, ptr [[B]], align 4
++; OFF-NEXT:    [[Y_EXT:%.*]] = zext i32 [[Y]] to i64
++; OFF-NEXT:    [[P:%.*]] = mul nuw i64 [[X1]], [[Y_EXT]]
++; OFF-NEXT:    ret i64 [[P]]
++;
++entry:
++  %x = load i32, ptr %a, align 4
++  %x1 = add nuw i32 %x, 1
++  %x1.ext = zext i32 %x1 to i64
++  %y = load i32, ptr %b, align 4
++  %y.ext = zext i32 %y to i64
++  %p = mul nuw i64 %x1.ext, %y.ext
++  ret i64 %p
++}
++
++; Times a constant that fits in 32 bits.
++define i64 @sext_times_small_const(ptr %a) {
++; CHECK-LABEL: define i64 @sext_times_small_const(
++; CHECK-SAME: ptr [[A:%.*]]) {
++; CHECK-NEXT:  [[ENTRY:.*:]]
++; CHECK-NEXT:    [[X:%.*]] = load i32, ptr [[A]], align 4
++; CHECK-NEXT:    [[X1:%.*]] = add nsw i32 [[X]], 3
++; CHECK-NEXT:    [[X1_EXT:%.*]] = sext i32 [[X1]] to i64
++; CHECK-NEXT:    [[P:%.*]] = mul nsw i64 [[X1_EXT]], 1000
++; CHECK-NEXT:    ret i64 [[P]]
++;
++; OFF-LABEL: define i64 @sext_times_small_const(
++; OFF-SAME: ptr [[A:%.*]]) {
++; OFF-NEXT:  [[ENTRY:.*:]]
++; OFF-NEXT:    [[X:%.*]] = load i32, ptr [[A]], align 4
++; OFF-NEXT:    [[PROMOTED:%.*]] = sext i32 [[X]] to i64
++; OFF-NEXT:    [[X1:%.*]] = add nsw i64 [[PROMOTED]], 3
++; OFF-NEXT:    [[P:%.*]] = mul nsw i64 [[X1]], 1000
++; OFF-NEXT:    ret i64 [[P]]
++;
++entry:
++  %x = load i32, ptr %a, align 4
++  %x1 = add nsw i32 %x, 3
++  %x1.ext = sext i32 %x1 to i64
++  %p = mul nsw i64 %x1.ext, 1000
++  ret i64 %p
++}
++
++; Not a widening multiply: the extension is still promoted to the load.
++define i64 @not_mul(ptr %a) {
++; CHECK-LABEL: define i64 @not_mul(
++; CHECK-SAME: ptr [[A:%.*]]) {
++; CHECK-NEXT:  [[ENTRY:.*:]]
++; CHECK-NEXT:    [[X:%.*]] = load i32, ptr [[A]], align 4
++; CHECK-NEXT:    [[PROMOTED:%.*]] = sext i32 [[X]] to i64
++; CHECK-NEXT:    [[X1:%.*]] = add nsw i64 [[PROMOTED]], 1
++; CHECK-NEXT:    [[R:%.*]] = add i64 [[X1]], 7
++; CHECK-NEXT:    ret i64 [[R]]
++;
++; OFF-LABEL: define i64 @not_mul(
++; OFF-SAME: ptr [[A:%.*]]) {
++; OFF-NEXT:  [[ENTRY:.*:]]
++; OFF-NEXT:    [[X:%.*]] = load i32, ptr [[A]], align 4
++; OFF-NEXT:    [[PROMOTED:%.*]] = sext i32 [[X]] to i64
++; OFF-NEXT:    [[X1:%.*]] = add nsw i64 [[PROMOTED]], 1
++; OFF-NEXT:    [[R:%.*]] = add i64 [[X1]], 7
++; OFF-NEXT:    ret i64 [[R]]
++;
++entry:
++  %x = load i32, ptr %a, align 4
++  %x1 = add nsw i32 %x, 1
++  %x1.ext = sext i32 %x1 to i64
++  %r = add i64 %x1.ext, 7
++  ret i64 %r
++}
++
++; Not a widening multiply either: the other operand is a full 64-bit value.
++define i64 @mul_by_i64(ptr %a, i64 %y) {
++; CHECK-LABEL: define i64 @mul_by_i64(
++; CHECK-SAME: ptr [[A:%.*]], i64 [[Y:%.*]]) {
++; CHECK-NEXT:  [[ENTRY:.*:]]
++; CHECK-NEXT:    [[X:%.*]] = load i32, ptr [[A]], align 4
++; CHECK-NEXT:    [[PROMOTED:%.*]] = sext i32 [[X]] to i64
++; CHECK-NEXT:    [[X1:%.*]] = add nsw i64 [[PROMOTED]], 1
++; CHECK-NEXT:    [[P:%.*]] = mul nsw i64 [[X1]], [[Y]]
++; CHECK-NEXT:    ret i64 [[P]]
++;
++; OFF-LABEL: define i64 @mul_by_i64(
++; OFF-SAME: ptr [[A:%.*]], i64 [[Y:%.*]]) {
++; OFF-NEXT:  [[ENTRY:.*:]]
++; OFF-NEXT:    [[X:%.*]] = load i32, ptr [[A]], align 4
++; OFF-NEXT:    [[PROMOTED:%.*]] = sext i32 [[X]] to i64
++; OFF-NEXT:    [[X1:%.*]] = add nsw i64 [[PROMOTED]], 1
++; OFF-NEXT:    [[P:%.*]] = mul nsw i64 [[X1]], [[Y]]
++; OFF-NEXT:    ret i64 [[P]]
++;
++entry:
++  %x = load i32, ptr %a, align 4
++  %x1 = add nsw i32 %x, 1
++  %x1.ext = sext i32 %x1 to i64
++  %p = mul nsw i64 %x1.ext, %y
++  ret i64 %p
++}
