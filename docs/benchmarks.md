@@ -1,47 +1,60 @@
 # Benchmarks
 
-## CPython on a Cortex-A35 board
+## CPython
 
-Board: Cortex-A35, 2 cores at 700 MHz, 512 MB RAM, the board's own glibc 2.41.
-CPython 3.14.9, all builds with PGO trained on the board (`-m test --pgo`) and
-LTO (clang: ThinLTO), `-fwrapv -mcpu=cortex-a35 -mno-outline-atomics` (GCC:
-`+crypto`). Nine small benchmarks (nbody, fannkuch, spectral_norm, calls,
-sorting, generators, strings and dicts, regex, json), 5 runs each, geometric
-mean of the medians (2026-10-23).
+Boards: Raspberry Pi 3 Model B+ (Cortex-A53, clock fixed at 900 MHz) and a
+Cortex-A35 board (700 MHz). Both have 32 KB + 32 KB L1 caches per core and a
+512 KB L2, and run Debian 13 with glibc 2.41.
 
-| CPython 3.14.9 | Speed vs LP64 | Max RSS | SQLite speedtest1 vs LP64 |
+The baseline is Debian's own `/usr/bin/python3.13` (LP64, GCC 14.2). Every
+other build is made the way Debian builds that interpreter: the same source
+(Debian's python3.13 3.13.5-2+deb13u5; for 3.14, upstream 3.14.9), Debian's
+configure arguments and hardening flags, the extension modules Debian builds
+into the interpreter, non-PIE, PGO with Debian's profile task (the full test
+suite, run under QEMU) and LTO (clang: ThinLTO), computed gotos. The builds
+are cross builds, so the answers that configure guesses when it cannot run
+its tests are replaced with the native ones and the result is checked
+against Debian's `pyconfig.h`. An LP64 build made this way matches Debian's
+binary in speed and memory, which validates the method.
+
+Nine small benchmarks (nbody, fannkuch, spectral_norm, calls, sorting,
+generators, strings and dicts, regex, json), 5 runs each, geometric mean of
+the medians, relative to Debian's `python3.13`. Memory is the max RSS of one
+run under `python -S`, with the standard library byte-compiled. Each number
+is the mean of two rounds (2026-10-27); unchanged builds repeat within 0.5%
+in speed and 0.3 MB in memory.
+
+| CPython | A53 | A35 | Max RSS |
 |---|---:|---:|---:|
-| LP64, GCC 14.2, PGO + LTO | 1.000 | 17.0 MB | 1.000 (15.52 s) |
-| ILP32, GCC 14.3, PGO + LTO | 1.009³ | 11.7 MB (-31%)³ | –³ |
-| ILP32, clang 22 + these patches, PGO + ThinLTO + tail-calling interpreter (default import limit 100) | 1.089 | 13.0 MB (-23%) | 0.958 |
-| ILP32, the same, linked with `-Wl,-plugin-opt=-import-instr-limit=30` | 1.09¹ | 12.7 MB (-25%) | 0.958² |
-| armhf (Thumb-2), GCC 14.2, PGO + LTO | 1.004 | 10.6 MB (-38%) | 0.859 |
+| Debian `python3.13`, LP64, GCC 14.2 | 1.000 | 1.000 | 15.7 MiB |
+| 3.13, LP64, GCC 14.2, made like Debian's | 1.002 | 0.997 | 15.5 MiB |
+| 3.13, ILP32, GCC 14.3 | 0.976 | 0.940 | 10.9 MiB (-31%) |
+| 3.13, ILP32, clang 22 with these patches | 0.991 | 0.968 | 12.6 MiB (-20%) |
+| 3.14, ILP32, GCC 14.3 | 1.035 | 0.988 | 11.5 MiB (-27%) |
+| 3.14, ILP32, clang 22 with these patches | 1.041 | 0.984 | 12.9 MiB (-18%) |
 
-¹ Derived from a separate run: the ratio to the same non-PIE ILP32 GCC binary,
-present in both runs, chained to the LP64 baseline (1.075 × 1.018). Both clang
-and LP64 are PIE; within noise of the default limit.
+The ILP32 GCC builds use `-mbranch-protection=bti`, since ILP32 GCC has no
+pac-ret; all other builds use `standard`. On these cores both are NOPs.
 
-² SQLite is a separate `-O2` build without PGO or LTO, so the import limit
-does not apply; there clang is 4% slower than LP64 GCC.
+- ILP32 against LP64, same recipe (GCC 3.13): 2.6% slower on the A53, 5.7%
+  on the A35, and 30% less memory.
+- Patch `0010` (address offset folding): 2.6% faster on the A53, 3.6% on the
+  A35, and about 3% less memory (clang 3.13, 2026-10-26).
+- `-fno-strict-overflow` instead of `-fwrapv`: 4.4% slower on the A53, 4.3%
+  on the A35, even with `0010` (see below).
+- ThinLTO `-import-instr-limit=30` instead of the default 100: 1.0% slower on
+  the A53, 1.3% on the A35, for 1–2% less memory. Keep the default.
+- Full LTO instead of ThinLTO, and `-mtune=cortex-a53`, made the clang build
+  slower on both boards.
+- The clang builds use 1.5–2 MB more memory than the GCC builds, nearly all
+  of it code: clang's `.text` is 4.80 MB against GCC's 3.29 MB (3.13). PGO
+  with ThinLTO inlines much more: the interpreter loop
+  (`_PyEval_EvalFrameDefault`) is 256 KB against 75 KB, and the start-up
+  function `_PyUnicode_InitStaticStrings` alone is 174 KB.
 
-³ PIE build, measured with its own LP64 baseline in a separate run
-(2026-10-23). Its SQLite speedtest1 was not measured as PIE (the GCC ILP32
-speedtest1 used here is not PIE).
-
-- ILP32 keeps the AArch64 speed and comes close to armhf in memory; armhf is
-  14% slower on SQLite. `/proc/self/smaps` shows where the memory goes: the
-  heap is 67% and other anonymous memory 49% smaller than with LP64.
-- The clang build uses 1.3 MB more than the GCC ILP32 build (1.0 MB with
-  limit 30), all of it code: its `.text` is 4.05 MB (3.82 MB) against
-  2.88 MB. The cause is ThinLTO's cross-module importing: without LTO, clang's
-  code is 7% smaller than GCC's, and ThinLTO adds 23%. Limit 30 saves about
-  0.3 MB of resident code at no speed cost; a limit of 10 saves a little more
-  but is 4% slower.
-- All builds are PIE. For GCC ILP32, PIE costs about 0.3 MB of max RSS
-  (130 KB of it RELRO) and no measurable speed.
-- Per benchmark, against the GCC ILP32 build (both PIE, default import
-  limit, same run), clang is best on function calls (+19%) and worst on json
-  (-4%).
+Earlier numbers in this file (2026-10-23) are withdrawn: those GCC builds had
+no computed gotos (configure's cross-compile guess), and the clang LTO builds
+were code-generated by an outdated LTO plugin without patches 0006–0012.
 
 ## Static code size
 

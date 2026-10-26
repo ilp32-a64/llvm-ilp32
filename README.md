@@ -9,8 +9,10 @@ Upstream LLVM supports ILP32 only in the back end: the clang front end was
 never finished, and the back end passes pointers in a way that is not
 compatible with GCC. These patches fill both gaps.
 
-On a Cortex-A35 board, CPython built for ILP32 with this clang is **9% faster**
-than the LP64 build and uses **23–25% less memory**.
+On Cortex-A53 and Cortex-A35 boards, CPython 3.13 built for ILP32 with this
+clang runs at **97–99% of the speed** of Debian's own LP64 `python3.13` and uses
+**about 20% less memory**. Built the same way, ILP32 uses 30% less memory than
+LP64. Patch `0010` alone makes it 2.6–3.6% faster.
 
 ## Build clang
 
@@ -44,23 +46,28 @@ clang --target=aarch64-openwrt-linux-musl_ilp32 --gcc-toolchain=$O --sysroot=$O 
   not support ILP32 yet.
 - For wrapping signed arithmetic use `-fwrapv`, not `-fno-strict-overflow`,
   which also wraps pointer arithmetic and makes the code larger.
-- With ThinLTO, link with `-Wl,-plugin-opt=-import-instr-limit=30`: same speed,
-  about 0.3 MB less memory.
+- With ThinLTO, keep the default import limit: `-import-instr-limit=30` saved
+  1–2% memory on CPython but cost 1.0–1.3% speed.
+- Pass back-end options (`-mllvm ...`) to an LTO link as
+  `-Wl,-plugin-opt=...`; at compile time they do not reach LTO code generation.
 - For the Cortex-A35 use `-mcpu=cortex-a35`.
 
-## Performance (Cortex-A35 board, CPython 3.14.9)
+## Performance (CPython, Cortex-A53 and Cortex-A35)
 
-| Build | Speed | Memory |
-|---|---:|---:|
-| LP64, GCC 14 | 1.00 | 17.0 MB |
-| ILP32, GCC 14 | 1.01 | 11.7 MB (-31%) |
-| ILP32, clang (PGO + ThinLTO + tail calls) | 1.09 | 13.0 MB (-23%) |
-| ILP32, clang, with `-import-instr-limit=30` | 1.09 | 12.7 MB (-25%) |
-| armhf, GCC 14 | 1.00 | 10.6 MB (-38%) |
+Speed relative to Debian 13's own `python3.13` (LP64, GCC); memory is the max RSS.
 
-All builds are PIE and use PGO and LTO; geometric mean of 9 benchmarks. Method, SQLite,
-per-benchmark results and a code size analysis:
-[docs/benchmarks.md](docs/benchmarks.md).
+| Build | A53 | A35 | Memory |
+|---|---:|---:|---:|
+| Debian `python3.13`, LP64, GCC | 1.000 | 1.000 | 15.7 MiB |
+| 3.13, LP64, GCC, made like Debian's | 1.002 | 0.997 | 15.5 MiB |
+| 3.13, ILP32, GCC | 0.976 | 0.940 | 10.9 MiB (-31%) |
+| 3.13, ILP32, clang with these patches | 0.991 | 0.968 | 12.6 MiB (-20%) |
+| 3.14, ILP32, GCC | 1.035 | 0.988 | 11.5 MiB (-27%) |
+| 3.14, ILP32, clang with these patches | 1.041 | 0.984 | 12.9 MiB (-18%) |
+
+All builds are made the way Debian builds its interpreter (non-PIE, PGO + LTO,
+the same flags); geometric mean of 9 benchmarks. Method, per-patch effects and
+a code size analysis: [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Patches (LLVM 22.1.8)
 
