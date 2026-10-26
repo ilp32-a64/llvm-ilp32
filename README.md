@@ -50,6 +50,8 @@ clang --target=aarch64-openwrt-linux-musl_ilp32 --gcc-toolchain=$O --sysroot=$O 
   1–2% memory on CPython but cost 1.0–1.3% speed.
 - Pass back-end options (`-mllvm ...`) to an LTO link as
   `-Wl,-plugin-opt=...`; at compile time they do not reach LTO code generation.
+- Known problems in upstream LLVM that these patches do not fix are listed in
+  the [issues](https://github.com/ilp32-a64/llvm-ilp32/issues).
 
 ## Performance (CPython, Cortex-A53 and Cortex-A35)
 
