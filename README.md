@@ -50,7 +50,6 @@ clang --target=aarch64-openwrt-linux-musl_ilp32 --gcc-toolchain=$O --sysroot=$O 
   1–2% memory on CPython but cost 1.0–1.3% speed.
 - Pass back-end options (`-mllvm ...`) to an LTO link as
   `-Wl,-plugin-opt=...`; at compile time they do not reach LTO code generation.
-- For the Cortex-A35 use `-mcpu=cortex-a35`.
 
 ## Performance (CPython, Cortex-A53 and Cortex-A35)
 
