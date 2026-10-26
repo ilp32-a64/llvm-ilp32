@@ -33,8 +33,10 @@ in speed and 0.3 MB in memory.
 | 3.14, ILP32, GCC 14.3 | 1.035 | 0.988 | 11.5 MiB (-27%) |
 | 3.14, ILP32, clang 22 with these patches | 1.041 | 0.984 | 12.9 MiB (-18%) |
 
-The ILP32 GCC builds use `-mbranch-protection=bti`, since ILP32 GCC has no
-pac-ret; all other builds use `standard`. On these cores both are NOPs.
+All builds in the table are non-PIE, like Debian's `python3.13` (Debian builds
+its interpreter without PIE). The ILP32 GCC builds use
+`-mbranch-protection=bti`, since ILP32 GCC has no pac-ret; all other builds
+use `standard`. On these cores both are NOPs.
 
 - ILP32 against LP64, same recipe (GCC 3.13): 2.6% slower on the A53, 5.7%
   on the A35, and 30% less memory.

@@ -65,9 +65,10 @@ Speed relative to Debian 13's own `python3.13` (LP64, GCC); memory is the max RS
 | 3.14, ILP32, GCC | 1.035 | 0.988 | 11.5 MiB (-27%) |
 | 3.14, ILP32, clang with these patches | 1.041 | 0.984 | 12.9 MiB (-18%) |
 
-All builds are made the way Debian builds its interpreter (non-PIE, PGO + LTO,
-the same flags); geometric mean of 9 benchmarks. Method, per-patch effects and
-a code size analysis: [docs/benchmarks.md](docs/benchmarks.md).
+All builds are non-PIE, like Debian's `python3.13`, and are made the way Debian
+builds that interpreter (PGO + LTO, the same flags); geometric mean of 9
+benchmarks. Method, per-patch effects and a code size analysis:
+[docs/benchmarks.md](docs/benchmarks.md).
 
 ## Patches (LLVM 22.1.8)
 
